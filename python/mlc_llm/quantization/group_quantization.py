@@ -204,7 +204,7 @@ class GroupQuantize:  # pylint: disable=too-many-instance-attributes
             return bb.finalize()
 
         def _compile_quantize_func(mod: IRModule) -> Callable:
-            if device_type in ["cuda", "rocm", "metal", "vulkan"]:
+            if device_type in ["cuda", "rocm", "metal", "vulkan", "opencl"]:
                 target = Target.current()
                 if target is None:
                     target = Target.from_device(device)
