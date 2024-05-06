@@ -259,11 +259,13 @@ struct FunctionTable {
       this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
       this->kv_cache_add_sequence_func_ = get_global_func("vm.builtin.kv_state_add_sequence");
       this->kv_cache_remove_sequence_func_ = get_global_func("vm.builtin.kv_state_remove_sequence");
+      this->kv_cache_enable_sliding_window_for_seq_ =
+          get_global_func("vm.builtin.attention_kv_cache_enable_sliding_window_for_seq");
       this->kv_cache_begin_forward_func_ = get_global_func("vm.builtin.kv_state_begin_forward");
       this->kv_cache_end_forward_func_ = get_global_func("vm.builtin.kv_state_end_forward");
       this->fkvcache_array_popn_ = get_global_func("vm.builtin.kv_state_popn");
-      // TODO(mlc-team): enable backtracing when using paged kvcache
-      this->support_backtracking_kv_ = true;
+      // note: We use max sequence length = 1 for RNN state for now, so disable back tracking
+      this->support_backtracking_kv_ = this->use_kv_state == KVStateKind::kAttention;
     }
   }
 
@@ -345,6 +347,7 @@ struct FunctionTable {
   PackedFunc reset_kv_cache_func_;
   PackedFunc kv_cache_add_sequence_func_;
   PackedFunc kv_cache_remove_sequence_func_;
+  PackedFunc kv_cache_enable_sliding_window_for_seq_;
   PackedFunc kv_cache_begin_forward_func_;
   PackedFunc kv_cache_end_forward_func_;
   bool support_backtracking_kv_;
@@ -558,16 +561,31 @@ class LLMChat {
       CHECK(partial_update) << "Key \"shift_fill_factor\" not found.";
     }
     if (config.count("conv_template")) {
-      ICHECK(config["conv_template"].is<std::string>());
-      std::string conv_template = config["conv_template"].get<std::string>();
-      this->conversation_ = Conversation::FromTemplate(conv_template);
+      if (config["conv_template"].is<picojson::object>()) {
+        this->conversation_.LoadJSONOverride(config["conv_template"], false);
+      } else {
+        ICHECK(config["conv_template"].is<std::string>());
+        LOG(WARNING)
+            << "Legacy conversation template detected. It will be deprecated in the future. "
+               "Please regenerate mlc-chat-config.json with the latest version";
+        std::string conv_template = config["conv_template"].get<std::string>();
+        this->conversation_ = Conversation::FromTemplate(conv_template);
+      }
       if (config.count("conv_config")) {
         // conv_config can override conv_template
-        this->conversation_.LoadJSONOverride(config["conv_config"], true);
+        try {
+          this->conversation_.LoadJSONOverride(config["conv_config"], true);
+        } catch (...) {
+          this->conversation_.LoadJSONOverrideLegacy(config["conv_config"], true);
+        }
       }
     } else if (config.count("conv_config")) {
       // without conv template, conv_config needs to be a complete config
-      this->conversation_.LoadJSONOverride(config["conv_config"], false);
+      try {
+        this->conversation_.LoadJSONOverride(config["conv_config"], false);
+      } catch (...) {
+        this->conversation_.LoadJSONOverrideLegacy(config["conv_config"], false);
+      }
     } else {
       CHECK(partial_update) << "Key \"conv_template\" and \"conv_config\" not found.";
     }
@@ -648,12 +666,17 @@ class LLMChat {
     this->params_ = ft_.LoadParams(model_path, device_, use_presharded_weights_);
     // Step 6. KV cache creation.
     if (ft_.use_kv_state == FunctionTable::KVStateKind::kAttention) {
+      int max_total_seq_length =
+          this->max_window_size_ == -1 ? this->sliding_window_size_ : this->max_window_size_;
+      ICHECK_GT(max_total_seq_length, 0);
       IntTuple max_num_sequence{1};
-      IntTuple max_total_sequence_length{this->max_window_size_};
+      IntTuple max_total_sequence_length{max_total_seq_length};
       IntTuple prefill_chunk_size{this->prefill_chunk_size_};
       IntTuple page_size{16};
-      this->kv_cache_ = ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length,
-                                                  prefill_chunk_size, page_size);
+      IntTuple support_sliding_window{sliding_window_size_ != -1};
+      this->kv_cache_ =
+          ft_.create_kv_cache_func_(max_num_sequence, max_total_sequence_length, prefill_chunk_size,
+                                    page_size, support_sliding_window);
     } else if (ft_.use_kv_state == FunctionTable::KVStateKind::kRNNState) {
       IntTuple max_num_sequence{1};
       IntTuple max_history_length{1};
@@ -682,8 +705,6 @@ class LLMChat {
     this->ResetRuntimeStats();
     this->ResetKVCache();
     this->total_seq_len_ = 0;
-    this->sliding_window_cache_offset_ = 0;
-    this->sink_triggered_ = false;
   }
 
   /*! \brief reset the runtime stats. */
@@ -969,19 +990,6 @@ class LLMChat {
             std::vector<int32_t>(prompt_tokens.begin() + begin, prompt_tokens.begin() + end);
         new_seq_len += static_cast<int64_t>(chunk.size());
         logits_on_device = this->ForwardTokens(chunk, new_seq_len);
-
-        // update window cache offset (prefill)
-        if (this->sliding_window_size_ != -1) {
-          if (sink_triggered_) {
-            sliding_window_cache_offset_ =
-                std::max((sliding_window_cache_offset_ + static_cast<int64_t>(chunk.size())) %
-                             sliding_window_size_,
-                         attention_sink_size_);
-          } else {
-            sliding_window_cache_offset_ += static_cast<int64_t>(chunk.size());
-            sink_triggered_ = sliding_window_cache_offset_ >= attention_sink_size_;
-          }
-        }
       }
       ICHECK_EQ(new_seq_len, total_seq_len_ + token_len) << "Expect chunking process all tokens";
     } else {
@@ -1020,18 +1028,6 @@ class LLMChat {
 
     NDArray logits_on_device = this->ForwardTokens({last_token}, total_seq_len_ + 1);
     total_seq_len_ += 1;
-
-    // update window cache offset (decoding)
-    if (this->sliding_window_size_ != -1) {
-      if (sink_triggered_) {
-        sliding_window_cache_offset_ = std::max(
-            (sliding_window_cache_offset_ + 1) % sliding_window_size_, attention_sink_size_);
-      } else {
-        sliding_window_cache_offset_ += 1;
-        sink_triggered_ = sliding_window_cache_offset_ >= attention_sink_size_;
-      }
-    }
-
     int32_t next_token = this->SampleTokenFromLogits(logits_on_device, generation_config);
 
     auto tend = std::chrono::high_resolution_clock::now();
@@ -1357,32 +1353,20 @@ class LLMChat {
     ObjectRef ret{nullptr};
     if (input_tokens.size() > 1 && ft_.prefill_func_.defined()) {
       ObjectRef input_data = ft_.CopyToWorker0(this->GetInputTokenNDArray(input_tokens));
-      if (sliding_window_size_ == -1) {
-        if (ft_.use_kv_state) {
-          int input_len = input_tokens.size();
-          IntTuple seq_ids_tuple({0});
-          ShapeTuple input_len_shape{input_len};
-          ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, input_len_shape);
-          input_data = ft_.nd_view_func_(input_data, input_len_shape);
-          auto embed = ft_.embed_func_(input_data, params_);
-          ShapeTuple embedding_shape = {1, input_len, GetHiddenSizeFromEmbedding(embed)};
-          embed = ft_.nd_view_func_(embed, embedding_shape);
-          ret = ft_.prefill_func_(embed, kv_cache_, params_);
-          ft_.kv_cache_end_forward_func_(kv_cache_);
-        } else {
-          ShapeTuple cur_pos_shape = ShapeTuple({cur_pos});
-          ret = ft_.prefill_func_(input_data, cur_pos_shape, kv_cache_, params_);
-        }
+      if (ft_.use_kv_state) {
+        int input_len = input_tokens.size();
+        IntTuple seq_ids_tuple({0});
+        ShapeTuple input_len_shape{input_len};
+        ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, input_len_shape);
+        input_data = ft_.nd_view_func_(input_data, input_len_shape);
+        auto embed = ft_.embed_func_(input_data, params_);
+        ShapeTuple embedding_shape = {1, input_len, GetHiddenSizeFromEmbedding(embed)};
+        embed = ft_.nd_view_func_(embed, embedding_shape);
+        ret = ft_.prefill_func_(embed, kv_cache_, params_);
+        ft_.kv_cache_end_forward_func_(kv_cache_);
       } else {
-        // Sliding window attention needs extra shape parameters
-        int64_t seq_len = static_cast<int64_t>(input_tokens.size());
-        // Number of elements in the cache
-        int64_t cache_len = std::min(this->sliding_window_size_, cur_pos - seq_len);
-        ShapeTuple cache_len_shape = ShapeTuple({cache_len});
-        ShapeTuple kv_seq_len_shape = ShapeTuple({cache_len + seq_len});
-        ShapeTuple cache_offset_shape = ShapeTuple({sliding_window_cache_offset_});
-        ret = ft_.prefill_func_(input_data, cache_len_shape, kv_seq_len_shape, cache_offset_shape,
-                                kv_cache_, params_);
+        ShapeTuple cur_pos_shape = ShapeTuple({cur_pos});
+        ret = ft_.prefill_func_(input_data, cur_pos_shape, kv_cache_, params_);
       }
     } else {
       // running decode function when prefill is not available
@@ -1397,30 +1381,18 @@ class LLMChat {
         }
         int64_t pos = cur_pos + i + 1 - input_tokens.size();
         ShapeTuple pos_shape = ShapeTuple({pos});
-        if (sliding_window_size_ == -1) {
-          if (ft_.use_kv_state) {
-            IntTuple seq_ids_tuple({0});
-            IntTuple append_length({1});
-            ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, append_length);
-            input_data = ft_.nd_view_func_(input_data, append_length);
-            auto embed = ft_.embed_func_(input_data, params_);
-            ShapeTuple embedding_shape = {1, 1, GetHiddenSizeFromEmbedding(embed)};
-            embed = ft_.nd_view_func_(embed, embedding_shape);
-            ret = ft_.decode_func_(embed, kv_cache_, params_);
-            ft_.kv_cache_end_forward_func_(kv_cache_);
-          } else {
-            ret = ft_.decode_func_(input_data, pos_shape, kv_cache_, params_);
-          }
+        if (ft_.use_kv_state) {
+          IntTuple seq_ids_tuple({0});
+          IntTuple append_length({1});
+          ft_.kv_cache_begin_forward_func_(kv_cache_, seq_ids_tuple, append_length);
+          input_data = ft_.nd_view_func_(input_data, append_length);
+          auto embed = ft_.embed_func_(input_data, params_);
+          ShapeTuple embedding_shape = {1, 1, GetHiddenSizeFromEmbedding(embed)};
+          embed = ft_.nd_view_func_(embed, embedding_shape);
+          ret = ft_.decode_func_(embed, kv_cache_, params_);
+          ft_.kv_cache_end_forward_func_(kv_cache_);
         } else {
-          // Sliding window attention needs extra shape parameters
-          int64_t seq_len = static_cast<int64_t>(input_tokens.size());
-          // Number of elements in the cache
-          int64_t cache_len = std::min(this->sliding_window_size_, pos - seq_len);
-          ShapeTuple cache_len_shape = ShapeTuple({cache_len});
-          ShapeTuple kv_seq_len_shape = ShapeTuple({cache_len + seq_len});
-          ShapeTuple cache_offset_shape = ShapeTuple({sliding_window_cache_offset_});
-          ret = ft_.decode_func_(input_data, cache_len_shape, kv_seq_len_shape, cache_offset_shape,
-                                 kv_cache_, params_);
+          ret = ft_.decode_func_(input_data, pos_shape, kv_cache_, params_);
         }
       }
     }
@@ -1538,6 +1510,11 @@ class LLMChat {
     ft_.reset_kv_cache_func_(kv_cache_);
     if (ft_.use_kv_state) {
       ft_.kv_cache_add_sequence_func_(kv_cache_, 0);
+      if (sliding_window_size_ != -1) {
+        int attention_sink_size = std::max(static_cast<int>(attention_sink_size_), 0);
+        ft_.kv_cache_enable_sliding_window_for_seq_(kv_cache_, 0, sliding_window_size_,
+                                                    attention_sink_size);
+      }
     }
   }
 
@@ -1609,10 +1586,6 @@ class LLMChat {
   std::string output_message_;
   // Whether encounter stop str
   bool stop_triggered_{false};
-  // Whether sink is in action
-  bool sink_triggered_{false};
-  // sliding window cache offset
-  int64_t sliding_window_cache_offset_{0};
   //----------------------------
   // Model configurations
   //----------------------------
@@ -1645,8 +1618,6 @@ class LLMChat {
   NDArray logits_on_cpu_{nullptr};
   // pre-allocated ndarray for decode function's input tokens
   DRef input_tokens_decode_{nullptr};
-  // KV cache config
-  serve::KVCacheConfig kv_cache_config_{nullptr};
 };
 
 /*!

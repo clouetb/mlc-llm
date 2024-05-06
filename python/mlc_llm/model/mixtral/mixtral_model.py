@@ -49,11 +49,13 @@ class MixtralMoE(nn.Module):
             self.num_local_experts,
             in_features=config.hidden_size,
             out_features=2 * self.intermediate_size,
+            tensor_parallel_shards=config.tensor_parallel_shards,
         )
         self.e2 = MixtralExperts(
             self.num_local_experts,
             in_features=self.intermediate_size,
             out_features=config.hidden_size,
+            tensor_parallel_shards=config.tensor_parallel_shards,
         )
         self.dtype = "float32"
 
@@ -74,7 +76,9 @@ class MixtralMoE(nn.Module):
         # expert_weights: [num_tokens, experts_per_tok]
         # expert_indices: [num_tokens, experts_per_tok]
         expert_weights, expert_indices = op_ext.moe_misc.gating_softmax_topk(gate, experts_per_tok)
-        use_ft = op_ext.get_store().faster_transformer and self.dtype == "float16"
+        use_ft = (
+            op_ext.get_store().cutlass_group_gemm or op_ext.get_store().faster_transformer
+        ) and self.dtype == "float16"
         if num_tokens == 1:
             # x: [num_tokens * experts_per_tok, hidden_size]
             x = _expert_forward(x, expert_indices)

@@ -126,7 +126,7 @@ inline bool GrammarStateMatcherBase::AcceptCodepoint(TCodepoint codepoint, bool 
 
   tmp_new_stack_tops_.clear();
   for (auto prev_top : prev_stack_tops) {
-    const auto& cur_rule_position = tree_[prev_top];
+    auto cur_rule_position = tree_[prev_top];
     auto current_sequence = grammar_->GetRuleExpr(cur_rule_position.sequence_id);
     if (cur_rule_position.parent_id == RulePosition::kNoParent &&
         cur_rule_position.element_id == current_sequence.size()) {
@@ -156,15 +156,15 @@ inline bool GrammarStateMatcherBase::AcceptCodepoint(TCodepoint codepoint, bool 
   }
   if (tmp_new_stack_tops_.empty()) {
     if (verbose) {
-      std::cout << "Codepoint: " << codepoint << " \"" << CodepointToPrintable(codepoint)
-                << "\" Rejected" << std::endl;
+      std::cout << "Codepoint: " << codepoint << " \"" << PrintAsEscaped(codepoint) << "\" Rejected"
+                << std::endl;
     }
     return false;
   }
   stack_tops_history_.PushHistory(tmp_new_stack_tops_);
   if (verbose) {
-    std::cout << "Codepoint: " << codepoint << " \"" << CodepointToPrintable(codepoint)
-              << "\" Accepted" << std::endl;
+    std::cout << "Codepoint: " << codepoint << " \"" << PrintAsEscaped(codepoint) << "\" Accepted"
+              << std::endl;
     std::cout << "Stack after accepting: " << PrintStackState() << std::endl;
   }
 #if TVM_LOG_DEBUG
@@ -194,7 +194,7 @@ inline std::string GrammarStateMatcherBase::PrintStackState(int steps_behind_lat
 inline void GrammarStateMatcherBase::InitStackState(RulePosition init_rule_position) {
   if (init_rule_position == kInvalidRulePosition) {
     // Initialize the stack with the main rule.
-    auto main_rule = grammar_->GetRule(0);
+    auto main_rule = grammar_->GetMainRule();
     auto main_rule_body = grammar_->GetRuleExpr(main_rule.body_expr_id);
     std::vector<int32_t> new_stack_tops;
     for (auto i : main_rule_body) {

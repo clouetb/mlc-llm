@@ -6,6 +6,8 @@
 #include "logit_processor.h"
 
 #include <picojson.h>
+#include <tvm/runtime/device_api.h>
+#include <tvm/runtime/nvtx.h>
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/runtime/threading_backend.h>
@@ -14,9 +16,19 @@ namespace mlc {
 namespace llm {
 namespace serve {
 
-inline void CopyArray(NDArray src, NDArray dst) {
+inline void CopyArray(NDArray src, NDArray dst, TVMStreamHandle copy_stream) {
   DLTensor dl_dst = *(dst.operator->());
-  NDArray::CopyFromTo(src.operator->(), &dl_dst);
+  NDArray::CopyFromTo(src.operator->(), &dl_dst, copy_stream);
+}
+
+inline void SyncCopyStream(Device device, TVMStreamHandle compute_stream,
+                           TVMStreamHandle copy_stream) {
+  // - If there is no particular copy stream, no action is needed.
+  if (copy_stream == nullptr) {
+    return;
+  }
+  // - Sync two streams.
+  DeviceAPI::Get(device)->SyncStreamFromTo(device, copy_stream, compute_stream);
 }
 
 /***************** LogitProcessor Implementation *****************/
@@ -61,6 +73,22 @@ class LogitProcessorImpl : public LogitProcessorObj {
         << "Function \"apply_logit_bias_inplace\" not found in model";
     CHECK(apply_penalty_func_.defined()) << "Function \"apply_penalty_inplace\" not found in model";
     CHECK(apply_bitmask_func_.defined()) << "Function \"apply_bitmask_inplace\" not found in model";
+
+    // If the device is CUDA/ROCm, we create a standalone copy stream, in
+    // purpose to hide the latency of auxiliary stream copy.
+    if (device.device_type == DLDeviceType::kDLCUDA ||
+        device.device_type == DLDeviceType::kDLROCM) {
+      // The compute stream is the default stream.
+      compute_stream_ = DeviceAPI::Get(device)->GetCurrentStream(device);
+      copy_stream_ = DeviceAPI::Get(device)->CreateStream(device);
+    }
+  }
+
+  ~LogitProcessorImpl() {
+    // Free the copy stream if defined.
+    if (copy_stream_ != nullptr) {
+      DeviceAPI::Get(device_)->FreeStream(device_, copy_stream_);
+    }
   }
 
   void InplaceUpdateLogits(NDArray logits,                                 //
@@ -69,6 +97,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
                            const Array<String>& request_ids,               //
                            const std::vector<int>* cum_num_token,          //
                            const std::vector<std::vector<SampleResult>>* draft_tokens) final {
+    NVTXScopedRange nvtx_scope("Logit inplace update");
     CHECK_EQ(logits->ndim, 2);
     CHECK_EQ(logits->shape[1], vocab_size_);
     CHECK(logits.DataType() == DataType::Float(32));
@@ -109,6 +138,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
   NDArray ComputeProbsFromLogits(NDArray logits, const Array<GenerationConfig>& generation_cfg,
                                  const Array<String>& request_ids,
                                  const std::vector<int>* cum_num_token) final {
+    NVTXScopedRange nvtx_scope("Compute probs from logits");
     // logits: (n, v)
     CHECK_EQ(logits->ndim, 2);
     CHECK_LE(logits->shape[0], max_num_token_);
@@ -145,7 +175,8 @@ class LogitProcessorImpl : public LogitProcessorObj {
     NDArray temperature_device = temperature_device_.CreateView({num_total_token}, dtype_f32_);
 
     // - Copy arrays to GPU.
-    CopyArray(/*src=*/temperature_host, /*dst=*/temperature_device);
+    CopyArray(/*src=*/temperature_host, /*dst=*/temperature_device, copy_stream_);
+    SyncCopyStream(device_, compute_stream_, copy_stream_);
 
     // - Call kernel.
     NDArray probs = softmax_func_(logits.CreateView({num_total_token, 1, vocab_size_}, dtype_f32_),
@@ -206,9 +237,10 @@ class LogitProcessorImpl : public LogitProcessorObj {
     NDArray token_logit_bias_device = token_logit_bias_device_.CreateView({num_token}, dtype_f32_);
 
     // - Copy arrays to GPU.
-    CopyArray(/*src=*/pos2seq_id_host, /*dst=*/pos2seq_id_device);
-    CopyArray(/*src=*/token_ids_host, /*dst=*/token_ids_device);
-    CopyArray(/*src=*/token_logit_bias_host, /*dst=*/token_logit_bias_device);
+    CopyArray(/*src=*/pos2seq_id_host, /*dst=*/pos2seq_id_device, copy_stream_);
+    CopyArray(/*src=*/token_ids_host, /*dst=*/token_ids_device, copy_stream_);
+    CopyArray(/*src=*/token_logit_bias_host, /*dst=*/token_logit_bias_device, copy_stream_);
+    SyncCopyStream(device_, compute_stream_, copy_stream_);
 
     // - Call kernel.
     apply_logit_bias_func_(logits, pos2seq_id_device, token_ids_device, token_logit_bias_device);
@@ -257,7 +289,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
           p_penalties[num_token_for_penalty * 3 + 2] = generation_cfg[i]->repetition_penalty;
           ++num_token_for_penalty;
           if (j > 0) {
-            mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], NDArray());
+            mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1);
           }
         }
         if (num_token_to_process != 1) {
@@ -286,11 +318,12 @@ class LogitProcessorImpl : public LogitProcessorObj {
     NDArray penalties_device = penalties_device_.CreateView({num_seq, 3}, dtype_f32_);
 
     // - Copy arrays to GPU.
-    CopyArray(/*src=*/seq_ids_host, /*dst=*/seq_ids_device);
-    CopyArray(/*src=*/pos2seq_id_host, /*dst=*/pos2seq_id_device);
-    CopyArray(/*src=*/token_ids_host, /*dst=*/token_ids_device);
-    CopyArray(/*src=*/token_cnt_host, /*dst=*/token_cnt_device);
-    CopyArray(/*src=*/penalties_host, /*dst=*/penalties_device);
+    CopyArray(/*src=*/seq_ids_host, /*dst=*/seq_ids_device, copy_stream_);
+    CopyArray(/*src=*/pos2seq_id_host, /*dst=*/pos2seq_id_device, copy_stream_);
+    CopyArray(/*src=*/token_ids_host, /*dst=*/token_ids_device, copy_stream_);
+    CopyArray(/*src=*/token_cnt_host, /*dst=*/token_cnt_device, copy_stream_);
+    CopyArray(/*src=*/penalties_host, /*dst=*/penalties_device, copy_stream_);
+    SyncCopyStream(device_, compute_stream_, copy_stream_);
 
     // - Call kernel.
     apply_penalty_func_(logits, seq_ids_device, pos2seq_id_device, token_ids_device,
@@ -335,7 +368,7 @@ class LogitProcessorImpl : public LogitProcessorObj {
           p_seq_ids[token_start_offset + j] = 1;
         }
         if (j > 0) {
-          mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], NDArray());
+          mstates[i]->AddDraftToken(draft_tokens->at(i)[j - 1], /*draft_token_slot=*/-1);
         }
       }
       if (token_number != 1) {
@@ -364,8 +397,9 @@ class LogitProcessorImpl : public LogitProcessorObj {
     NDArray bitmask_device = bitmask_device_.CreateView({batch_size, bitmask_size_}, dtype_i32_);
 
     // - Copy arrays to GPU.
-    CopyArray(/*src=*/seq_ids_host, /*dst=*/seq_ids_device);
-    CopyArray(/*src=*/bitmask_host, /*dst=*/bitmask_device);
+    CopyArray(/*src=*/seq_ids_host, /*dst=*/seq_ids_device, copy_stream_);
+    CopyArray(/*src=*/bitmask_host, /*dst=*/bitmask_device, copy_stream_);
+    SyncCopyStream(device_, compute_stream_, copy_stream_);
 
     // - Call kernel.
     apply_bitmask_func_(logits, seq_ids_device, bitmask_device);
@@ -407,6 +441,10 @@ class LogitProcessorImpl : public LogitProcessorObj {
   NDArray temperature_device_;
   // Event trace recorder.
   Optional<EventTraceRecorder> trace_recorder_;
+  // The device stream for the default computation operations.
+  TVMStreamHandle compute_stream_ = nullptr;
+  // The device stream for copying auxiliary data structure to GPU.
+  TVMStreamHandle copy_stream_ = nullptr;
   // A small epsilon.
   const double eps_ = 1e-5;
 };

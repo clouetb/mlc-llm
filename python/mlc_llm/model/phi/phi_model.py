@@ -64,9 +64,20 @@ class Phi1Config(ConfigBase):  # pylint: disable=too-many-instance-attributes
                     "provided in `config.json`."
                 )
         if self.prefill_chunk_size == 0:
-            self.prefill_chunk_size = self.context_window_size
-        if self.prefill_chunk_size > self.context_window_size:
-            self.prefill_chunk_size = self.context_window_size
+            logger.info(
+                "%s defaults to %d",
+                bold("prefill_chunk_size"),
+                min(self.context_window_size, 2048),
+            )
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
+        elif self.prefill_chunk_size > self.context_window_size:
+            logger.info(
+                "Overriding %s from %d to %d",
+                bold("prefill_chunk_size"),
+                self.prefill_chunk_size,
+                min(self.context_window_size, 2048),
+            )
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
         if self.num_key_value_heads == 0 or self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         if self.intermediate_size == 0 or self.intermediate_size is None:
@@ -364,6 +375,8 @@ class PhiForCausalLM(nn.Module):
     def batch_prefill(
         self, input_embeds: Tensor, logit_positions: Tensor, paged_kv_cache: PagedKVCache
     ):
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
         logits = self.batch_forward(input_embeds, paged_kv_cache, logit_positions)
         return logits, paged_kv_cache
 
@@ -384,18 +397,20 @@ class PhiForCausalLM(nn.Module):
         embeds = self.transformer.embd(input_ids)
         return embeds
 
-    def create_paged_kv_cache(
+    def create_paged_kv_cache(  # pylint: disable=too-many-arguments
         self,
         max_batch_size: tir.Var,
         max_total_seq_len: tir.Var,
         prefill_chunk_size: tir.Var,
         page_size: tir.Var,
+        support_sliding_window: tir.Var,
     ) -> PagedKVCache:
         return PagedKVCache.create_generic(
             max_batch_size=max_batch_size,
             max_total_seq_len=max_total_seq_len,
             prefill_chunk_size=prefill_chunk_size,
             page_size=page_size,
+            support_sliding_window=support_sliding_window,
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
             num_key_value_heads=self.num_key_value_heads // self.tensor_parallel_shards,
@@ -470,6 +485,7 @@ class PhiForCausalLM(nn.Module):
                 "max_total_seq_len": int,
                 "prefill_chunk_size": int,
                 "page_size": int,
+                "support_sliding_window": int,
                 "$": {
                     "param_mode": "none",
                     "effect_mode": "none",

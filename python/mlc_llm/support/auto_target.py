@@ -1,6 +1,7 @@
 """Helper functions for target auto-detection."""
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 from tvm import IRModule, relax
@@ -192,11 +193,51 @@ def _build_android():
     return build
 
 
+def _build_android_so():
+    def build(mod: IRModule, args: "CompileArgs", pipeline=None):
+        output = args.output
+        mod = _add_system_lib_prefix(mod, args.system_lib_prefix, is_system_lib=False)
+        assert output.suffix == ".so"
+        relax.build(
+            mod,
+            target=args.target,
+            pipeline=pipeline,
+            system_lib=False,
+        ).export_library(
+            str(output),
+            fcompile=ndk.create_shared,
+        )
+
+    return build
+
+
 def _build_webgpu():
     def build(mod: IRModule, args: "CompileArgs", pipeline=None):
         output = args.output
         mod = _add_system_lib_prefix(mod, args.system_lib_prefix, is_system_lib=True)
         assert output.suffix == ".wasm"
+
+        # Try to locate `mlc_wasm_runtime.bc`
+        bc_path = None
+        bc_candidates = ["web/dist/wasm/mlc_wasm_runtime.bc"]
+        if os.environ.get("MLC_LLM_HOME", None):
+            mlc_source_home_dir = os.environ["MLC_LLM_HOME"]
+            bc_candidates.append(
+                os.path.join(mlc_source_home_dir, "web", "dist", "wasm", "mlc_wasm_runtime.bc")
+            )
+        error_info = (
+            "Cannot find library: mlc_wasm_runtime.bc\n"
+            + "Make sure you have run `./web/prep_emcc_deps.sh` and "
+            + "`export MLC_LLM_HOME=/path/to/mlc-llm` so that we can locate the file. "
+            + "We tried to look at candidate paths:\n"
+        )
+        for candidate in bc_candidates:
+            error_info += candidate + "\n"
+            if Path(candidate).exists():
+                bc_path = candidate
+        if not bc_path:
+            raise RuntimeError(error_info)
+
         relax.build(
             mod,
             target=args.target,
@@ -204,6 +245,7 @@ def _build_webgpu():
             system_lib=True,
         ).export_library(
             str(output),
+            libs=[bc_path],
         )
 
     return build
@@ -253,12 +295,18 @@ def _build_default():
 
 def detect_cuda_arch_list(target: Target) -> List[int]:
     """Detect the CUDA architecture list from the target."""
+
+    def convert_to_num(arch_str):
+        arch_num_str = "".join(filter(str.isdigit, arch_str))
+        assert arch_num_str, f"'{arch_str}' does not contain any digits"
+        return int(arch_num_str)
+
     assert target.kind.name == "cuda", f"Expect target to be CUDA, but got {target}"
     if MLC_MULTI_ARCH is not None:
-        multi_arch = [int(x.strip()) for x in MLC_MULTI_ARCH.split(",")]
+        multi_arch = [convert_to_num(x) for x in MLC_MULTI_ARCH.split(",")]
     else:
         assert target.arch.startswith("sm_")
-        multi_arch = [int(target.arch[3:])]
+        multi_arch = [convert_to_num(target.arch[3:])]
     multi_arch = list(set(multi_arch))
     return multi_arch
 
@@ -269,13 +317,13 @@ def _register_cuda_hook(target: Target):
         logger.info("Generating code for CUDA architecture: %s", bold(default_arch))
         logger.info(
             "To produce multi-arch fatbin, set environment variable %s. "
-            "Example: MLC_MULTI_ARCH=70,72,75,80,86,87,89,90",
+            "Example: MLC_MULTI_ARCH=70,72,75,80,86,87,89,90a",
             bold("MLC_MULTI_ARCH"),
         )
         multi_arch = None
     else:
         logger.info("%s %s: %s", FOUND, bold("MLC_MULTI_ARCH"), MLC_MULTI_ARCH)
-        multi_arch = [int(x.strip()) for x in MLC_MULTI_ARCH.split(",")]
+        multi_arch = [x.strip() for x in MLC_MULTI_ARCH.split(",")]
         logger.info("Generating code for CUDA architecture: %s", multi_arch)
 
     @register_func("tvm_callback_cuda_compile", override=True)
@@ -306,7 +354,9 @@ def detect_system_lib_prefix(
     prefix_hint : str
         The hint for the system lib prefix.
     """
-    if prefix_hint == "auto" and target_hint in ["iphone", "android"]:
+    if prefix_hint == "auto" and (
+        target_hint.startswith("iphone") or target_hint.startswith("android")
+    ):
         prefix = f"{model_name}_{quantization}_".replace("-", "_")
         logger.warning(
             "%s is automatically picked from the filename, %s, this allows us to use the filename "
@@ -345,6 +395,28 @@ PRESET = {
             },
         },
         "build": _build_android,
+    },
+    "android:adreno": {
+        "target": {
+            "kind": "opencl",
+            "device": "adreno",
+            "host": {
+                "kind": "llvm",
+                "mtriple": "aarch64-linux-android",
+            },
+        },
+        "build": _build_android,
+    },
+    "android:adreno-so": {
+        "target": {
+            "kind": "opencl",
+            "device": "adreno",
+            "host": {
+                "kind": "llvm",
+                "mtriple": "aarch64-linux-android",
+            },
+        },
+        "build": _build_android_so,
     },
     "metal:x86-64": {
         "target": {
@@ -395,6 +467,7 @@ PRESET = {
             "max_shared_memory_per_block": 32768,
             "thread_warp_size": 1,
             "supports_float16": 1,
+            "supports_int64": 1,
             "supports_int16": 1,
             "supports_int8": 1,
             "supports_8bit_buffer": 1,

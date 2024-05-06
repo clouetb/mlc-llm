@@ -15,15 +15,15 @@ TVM_REGISTER_OBJECT_TYPE(RequestModelStateNode);
 
 RequestModelState::RequestModelState(
     Request request, int model_id, int64_t internal_id, Array<Data> inputs,
-    std::shared_ptr<GrammarStateInitContext> json_grammar_state_init_ctx) {
+    const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx) {
   ObjectPtr<RequestModelStateNode> n = make_object<RequestModelStateNode>();
   n->model_id = model_id;
   n->internal_id = internal_id;
   n->inputs = std::move(inputs);
 
-  if (request->generation_cfg->response_format.type == "json_object") {
+  if (grammar_state_init_ctx.has_value()) {
     // TODO(yixin): add support for stop_token_ids
-    n->grammar_state_matcher = GrammarStateMatcher(json_grammar_state_init_ctx);
+    n->grammar_state_matcher = GrammarStateMatcher(grammar_state_init_ctx.value());
   }
 
   n->request = std::move(request);
@@ -59,9 +59,9 @@ void RequestModelStateNode::CommitToken(SampleResult sampled_token) {
   }
 }
 
-void RequestModelStateNode::AddDraftToken(SampleResult sampled_token, NDArray prob_dist) {
+void RequestModelStateNode::AddDraftToken(SampleResult sampled_token, int draft_token_slot) {
   draft_output_tokens.push_back(std::move(sampled_token));
-  draft_output_prob_dist.push_back(std::move(prob_dist));
+  draft_token_slots.push_back(draft_token_slot);
   appeared_token_ids[sampled_token.sampled_token_id.first] += 1;
 }
 
@@ -69,14 +69,17 @@ void RequestModelStateNode::RemoveLastDraftToken() {
   ICHECK(!draft_output_tokens.empty());
   auto it = appeared_token_ids.find(draft_output_tokens.back().sampled_token_id.first);
   draft_output_tokens.pop_back();
-  draft_output_prob_dist.pop_back();
   CHECK(it != appeared_token_ids.end());
   if (--it->second == 0) {
     appeared_token_ids.erase(it);
   }
 }
 
-void RequestModelStateNode::RemoveAllDraftTokens() {
+void RequestModelStateNode::RemoveAllDraftTokens(std::vector<int>* removed_draft_token_slots) {
+  if (removed_draft_token_slots != nullptr) {
+    removed_draft_token_slots->assign(draft_token_slots.begin(), draft_token_slots.end());
+  }
+  draft_token_slots.clear();
   while (!draft_output_tokens.empty()) {
     RemoveLastDraftToken();
   }
@@ -89,7 +92,8 @@ TVM_REGISTER_OBJECT_TYPE(RequestStateEntryNode);
 RequestStateEntry::RequestStateEntry(
     Request request, int num_models, int64_t internal_id, int rng_seed,
     const std::vector<std::string>& token_table,
-    std::shared_ptr<GrammarStateInitContext> json_grammar_state_init_ctx, int parent_idx) {
+    const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx,
+    int parent_idx) {
   ObjectPtr<RequestStateEntryNode> n = make_object<RequestStateEntryNode>();
   Array<RequestModelState> mstates;
   Array<Data> inputs;
@@ -98,8 +102,7 @@ RequestStateEntry::RequestStateEntry(
   }
   mstates.reserve(num_models);
   for (int i = 0; i < num_models; ++i) {
-    mstates.push_back(
-        RequestModelState(request, i, internal_id, inputs, json_grammar_state_init_ctx));
+    mstates.push_back(RequestModelState(request, i, internal_id, inputs, grammar_state_init_ctx));
   }
   n->status = RequestStateStatus::kPending;
   n->rng = RandomGenerator(rng_seed);
@@ -116,18 +119,10 @@ RequestStateEntry::RequestStateEntry(
 
 DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tokenizer,
                                                             int max_single_sequence_length) {
-  // - Case 0. There is remaining draft output ==> Unfinished
-  //   All draft outputs are supposed to be processed before finish.
-  for (RequestModelState mstate : mstates) {
-    if (!mstate->draft_output_tokens.empty()) {
-      return {{}, {}, Optional<String>()};
-    }
-  }
-
   std::vector<int32_t> return_token_ids;
   std::vector<String> logprob_json_strs;
   Optional<String> finish_reason;
-  const std::vector<SampleResult>& committed_tokens = mstates[0]->committed_tokens;
+  const std::vector<SampleResult>& committed_tokens = this->mstates[0]->committed_tokens;
   int num_committed_tokens = committed_tokens.size();
   ICHECK_LE(this->next_callback_token_pos, num_committed_tokens);
 
@@ -160,7 +155,7 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
               request->generation_cfg->stop_token_ids.begin(),
               request->generation_cfg->stop_token_ids.end(),
               [&return_token_ids, i](int32_t token) { return token == return_token_ids[i]; })) {
-        // Stop token matched. Erase all tokens after the current position.
+        // Stop token matched. Erase the stop token and all tokens after it.
         finish_reason = "stop";
         while (static_cast<int>(return_token_ids.size()) > i) {
           return_token_ids.pop_back();
@@ -170,11 +165,19 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
     }
   }
 
+  // Case 4. When stop token is not detected (e.g. ignore_eos is set), but the grammar state is
+  // terminated, stop the generation and pop the last token (used to trigger the termination).
+  if (finish_reason != "stop" && this->mstates[0]->grammar_state_matcher.defined() &&
+      this->mstates[0]->grammar_state_matcher.value()->IsTerminated()) {
+    return_token_ids.pop_back();
+    finish_reason = "stop";
+  }
+
   if (finish_reason.defined()) {
     return {return_token_ids, logprob_json_strs, finish_reason};
   }
 
-  // Case 4. Generation reaches the specified max generation length ==> Finished
+  // Case 5. Generation reaches the specified max generation length ==> Finished
   // `max_tokens` means the generation length is limited by model capacity.
   if (request->generation_cfg->max_tokens >= 0 &&
       num_committed_tokens >= request->generation_cfg->max_tokens) {
@@ -182,7 +185,7 @@ DeltaRequestReturn RequestStateEntryNode::GetReturnTokenIds(const Tokenizer& tok
     return_token_ids.insert(return_token_ids.end(), remaining.begin(), remaining.end());
     return {return_token_ids, logprob_json_strs, String("length")};
   }
-  // Case 5. Total length of the request reaches the maximum single sequence length ==> Finished
+  // Case 6. Total length of the request reaches the maximum single sequence length ==> Finished
   if (request->input_total_length + num_committed_tokens >= max_single_sequence_length) {
     std::vector<int32_t> remaining = stop_str_handler->Finish();
     return_token_ids.insert(return_token_ids.end(), remaining.begin(), remaining.end());

@@ -1,7 +1,7 @@
 """The standard conversation protocol in MLC LLM"""
 
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Type, TypeVar, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -15,6 +15,9 @@ class MessagePlaceholders(Enum):
     ASSISTANT = "{assistant_message}"
     TOOL = "{tool_message}"
     FUNCTION = "{function_string}"
+
+
+T = TypeVar("T", bound="BaseModel")
 
 
 class Conversation(BaseModel):
@@ -42,6 +45,9 @@ class Conversation(BaseModel):
     # The system token ids to be prepended at the beginning of tokenized
     # generated prompt.
     system_prefix_token_ids: Optional[List[int]] = None
+    # Whether or not to append user role and separator after the system message.
+    # This is mainly for [INST] [/INST] style prompt format
+    add_role_after_system_message: bool = True
 
     # The conversation roles
     roles: Dict[str, str]
@@ -53,7 +59,7 @@ class Conversation(BaseModel):
     # The conversation history messages.
     # Each message is a pair of strings, denoting "(role, content)".
     # The content can be None.
-    messages: List[Tuple[str, Optional[str]]] = Field(default_factory=lambda: [])
+    messages: List[Tuple[str, Optional[Union[str, List[Dict]]]]] = Field(default_factory=lambda: [])
 
     # The separators between messages when concatenating into a single prompt.
     # List size should be either 1 or 2.
@@ -95,42 +101,139 @@ class Conversation(BaseModel):
             raise ValueError("seps should have size 1 or 2.")
         return seps
 
-    def as_prompt(self) -> str:
+    def to_json_dict(self) -> Dict[str, Any]:
+        """Convert to a json dictionary"""
+        return self.model_dump(exclude_none=True)
+
+    @classmethod
+    def from_json_dict(cls: Type[T], json_dict: Dict[str, Any]) -> T:
+        """Convert from a json dictionary"""
+        return Conversation.model_validate(json_dict)
+
+    # pylint: disable=too-many-branches
+    def as_prompt(self, config=None) -> List[Any]:
         """Convert the conversation template and history messages to
         a single prompt.
+
+        Returns
+        -------
+        prompts : List[Union[str, "mlc_llm.serve.data.Data"]]
+            The prompts converted from the conversation messages.
+            We use Any in the signature to avoid cyclic import.
         """
+        from ..serve import data  # pylint: disable=import-outside-toplevel
+
         # - Get the system message.
         system_msg = self.system_template.replace(
             MessagePlaceholders.SYSTEM.value, self.system_message
         )
 
         # - Get the message strings.
-        message_list: List[str] = []
+        message_list: List[Union[str, data.Data]] = []
         separators = list(self.seps)
         if len(separators) == 1:
             separators.append(separators[0])
-        for role, content in self.messages:  # pylint: disable=not-an-iterable
+
+        if system_msg != "":
+            message_list.append(system_msg)
+
+        for i, (role, content) in enumerate(self.messages):  # pylint: disable=not-an-iterable
             if role not in self.roles.keys():
                 raise ValueError(f'Role "{role}" is not a supported role in {self.roles.keys()}')
             separator = separators[role == "assistant"]  # check assistant role
-            if content is not None:
-                message_string = (
-                    self.roles[role]
-                    + self.role_content_sep
+
+            if content is None:
+                message_list.append(self.roles[role] + self.role_empty_sep)
+                continue
+
+            role_prefix = (
+                ""
+                # Do not append role prefix if this is the first message and there
+                # is already a system message
+                if (not self.add_role_after_system_message and system_msg != "" and i == 0)
+                else self.roles[role] + self.role_content_sep
+            )
+            if isinstance(content, str):
+                message_list.append(
+                    role_prefix
                     + self.role_templates[role].replace(
                         MessagePlaceholders[role.upper()].value, content
                     )
                     + separator
                 )
-            else:
-                message_string = self.roles[role] + self.role_empty_sep
-            message_list.append(message_string)
+                continue
 
-        prompt = system_msg + separators[0] + "".join(message_list)
+            message_list.append(role_prefix)
 
-        # Replace the last function string placeholder with actual function string
-        prompt = self.function_string.join(prompt.rsplit(MessagePlaceholders.FUNCTION.value, 1))
-        # Replace with remaining function string placeholders with empty string
-        prompt = prompt.replace(MessagePlaceholders.FUNCTION.value, "")
+            for item in content:
+                assert isinstance(item, dict), "Content should be a string or a list of dicts"
+                assert "type" in item, "Content item should have a type field"
+                if item["type"] == "text":
+                    message = self.role_templates[role].replace(
+                        MessagePlaceholders[role.upper()].value, item["text"]
+                    )
+                    message_list.append(message)
+                elif item["type"] == "image_url":
+                    assert config is not None, "Model config is required"
+                    image_url = _get_url_from_item(item)
+                    message_list.append(data.ImageData.from_url(image_url, config))
+                else:
+                    raise ValueError(f"Unsupported content type: {item['type']}")
+
+            message_list.append(separator)
+
+        prompt = _combine_consecutive_messages(message_list)
+
+        if not any(isinstance(item, data.ImageData) for item in message_list):
+            # Replace the last function string placeholder with actual function string
+            prompt[0] = self.function_string.join(
+                prompt[0].rsplit(MessagePlaceholders.FUNCTION.value, 1)
+            )
+            # Replace with remaining function string placeholders with empty string
+            prompt[0] = prompt[0].replace(MessagePlaceholders.FUNCTION.value, "")
 
         return prompt
+
+
+def _get_url_from_item(item: Dict) -> str:
+    image_url: str
+    assert "image_url" in item, "Content item should have an image_url field"
+    if isinstance(item["image_url"], str):
+        image_url = item["image_url"]
+    elif isinstance(item["image_url"], dict):
+        assert (
+            "url" in item["image_url"]
+        ), "Content image_url item should be a string or a dict with a url field"  # pylint: disable=line-too-long
+        image_url = item["image_url"]["url"]
+    else:
+        raise ValueError(
+            "Content image_url item type not supported. "
+            "Should be a string or a dict with a url field."
+        )
+    return image_url
+
+
+def _combine_consecutive_messages(messages: List[Any]) -> List[Any]:
+    """Combining consecutive strings into one.
+
+    Parameters
+    ----------
+    messages : List[Union[str, "mlc_llm.serve.data.Data"]]
+        The input messages to be combined.
+        We use Any in the signature to avoid cyclic import.
+
+    Returns
+    -------
+    updated_messages : List[Union[str, "mlc_llm.serve.data.Data"]]
+        The combined messages
+    """
+    if len(messages) == 0:
+        return []
+
+    combined_messages = [messages[0]]
+    for message in messages[1:]:
+        if isinstance(message, str) and isinstance(combined_messages[-1], str):
+            combined_messages[-1] += message
+        else:
+            combined_messages.append(message)
+    return combined_messages

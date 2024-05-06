@@ -59,12 +59,12 @@ std::string BNFGrammarPrinter::PrintCharacterClass(const RuleExpr& rule_expr) {
     result += "^";
   }
   for (auto i = 0; i < rule_expr.data_len; i += 2) {
-    result += CodepointToPrintable(rule_expr[i], kCustomEscapeMap);
+    result += PrintAsEscaped(rule_expr[i], kCustomEscapeMap);
     if (rule_expr[i] == rule_expr[i + 1]) {
       continue;
     }
     result += "-";
-    result += CodepointToPrintable(rule_expr[i + 1], kCustomEscapeMap);
+    result += PrintAsEscaped(rule_expr[i + 1], kCustomEscapeMap);
   }
   result += "]";
   return result;
@@ -107,7 +107,7 @@ std::string BNFGrammarPrinter::PrintCharacterClassStar(const RuleExpr& rule_expr
   return PrintRuleExpr(rule_expr[0]) + "*";
 }
 
-String BNFGrammarPrinter::ToString() {
+std::string BNFGrammarPrinter::ToString() {
   std::string result;
   auto num_rules = grammar_->NumRules();
   for (auto i = 0; i < num_rules; ++i) {
@@ -120,7 +120,7 @@ TVM_REGISTER_GLOBAL("mlc.serve.BNFGrammarToString").set_body_typed([](const BNFG
   return BNFGrammarPrinter(grammar).ToString();
 });
 
-String BNFGrammarJSONSerializer::ToString() {
+std::string BNFGrammarJSONSerializer::ToString() {
   picojson::object grammar_json;
 
   picojson::array rules_json;

@@ -1,4 +1,5 @@
 """Help message for CLI arguments."""
+
 HELP = {
     "config": (
         """
@@ -22,10 +23,12 @@ The quantization mode we use to compile. If unprovided, will infer from `model`.
 """.strip(),
     "model": """
 A path to ``mlc-chat-config.json``, or an MLC model directory that contains `mlc-chat-config.json`.
+It can also be a link to a HF repository pointing to an MLC compiled model.
 """.strip(),
-    "model_lib_path": """
+    "model_lib": """
 The full path to the model library file to use (e.g. a ``.so`` file). If unspecified, we will use
-the provided ``model`` to search over possible paths.
+the provided ``model`` to search over possible paths. It the model lib is not found, it will be 
+compiled in a JIT manner.
 """.strip(),
     "model_type": """
 Model architecture such as "llama". If not set, it is inferred from `mlc-chat-config.json`.
@@ -111,7 +114,7 @@ This flag subjects to future refactoring.
 the number of sinks is 4. This flag subjects to future refactoring.
 """.strip(),
     "max_batch_size": """
-The maximum allowed batch size set for batch prefill/decode function.
+The maximum allowed batch size set for the KV cache to concurrently support.
 """.strip(),
     """tensor_parallel_shards""": """
 Number of shards to split the model into in tensor parallelism multi-gpu inference.
@@ -139,4 +142,76 @@ The prompt of the text generation.
     "generate_length": """
 The target length of the text generation.
 """.strip(),
+    "max_total_sequence_length_serve": """
+The KV cache total token capacity, i.e., the maximum total number of tokens that
+the KV cache support. This decides the GPU memory size that the KV cache consumes.
+If not specified, system will automatically estimate the maximum capacity based
+on the vRAM size on GPU.
+""".strip(),
+    "prefill_chunk_size_serve": """
+The maximum number of tokens the model passes for prefill each time.
+It should not exceed the prefill chunk size in model config.
+If not specified, this defaults to the prefill chunk size in model config.
+""".strip(),
+    "max_history_size_serve": """
+The maximum history length for rolling back the RNN state. 
+If unspecified, the default value is 1.
+KV cache does not need this. 
+""".strip(),
+    "enable_tracing_serve": """
+Enable Chrome Tracing for the server.
+After enabling, you can send POST request to the "debug/dump_event_trace" entrypoint
+to get the Chrome Trace. For example,
+"curl -X POST http://127.0.0.1:8000/debug/dump_event_trace -H "Content-Type: application/json" -d '{"model": "dist/llama"}'"
+""".strip(),
+    "mode_serve": """
+The engine mode in MLC LLM. We provide three preset modes: "local", "interactive" and "server".
+The default mode is "local".
+The choice of mode decides the values of "--max-batch-size", "--max-total-seq-length" and
+"--prefill-chunk-size" when they are not explicitly specified.
+1. Mode "local" refers to the local server deployment which has low request concurrency.
+   So the max batch size will be set to 4, and max total sequence length and prefill chunk size
+   are set to the context window size (or sliding window size) of the model.
+2. Mode "interactive" refers to the interactive use of server, which has at most 1 concurrent
+   request. So the max batch size will be set to 1, and max total sequence length and prefill
+   chunk size are set to the context window size (or sliding window size) of the model.
+3. Mode "server" refers to the large server use case which may handle many concurrent request
+   and want to use GPU memory as much as possible. In this mode, we will automatically infer
+   the largest possible max batch size and max total sequence length.
+You can manually specify arguments "--max-batch-size", "--max-total-seq-length" and
+"--prefill-chunk-size" to override the automatic inferred values.
+""".strip(),
+    "additional_models_serve": """
+The model paths and (optional) model library paths of additional models (other than the main model).
+When engine is enabled with speculative decoding, additional models are needed.
+The way of specifying additional models is:
+"--additional-models model_path_1 model_path_2 ..." or
+"--additional-models model_path_1:model_lib_1 model_path_2 ...".
+When the model lib of a model is not given, JIT model compilation will be activated
+to compile the model automatically.
+""",
+    "gpu_memory_utilization_serve": """
+A number in (0, 1) denoting the fraction of GPU memory used by the server in total.
+It is used to infer to maximum possible KV cache capacity.
+When it is unspecified, it defaults to 0.85.
+Under mode "local" or "interactive", the actual memory usage may be significantly smaller than
+this number. Under mode "server", the actual memory usage may be slightly larger than this number.
+""",
+    "speculative_mode_serve": """
+The speculative decoding mode. Right now three options are supported:
+ - "disable", where speculative decoding is not enabled,
+ - "small_draft", denoting the normal speculative decoding (small draft) style,
+ - "eagle", denoting the eagle-style speculative decoding.
+The default mode is "disable".
+""",
+    "spec_draft_length_serve": """
+The number of draft tokens to generate in speculative proposal. The default values is 4.
+""",
+    "engine_config_serve": """
+The MLCEngine execution configuration.
+Currently speculative decoding mode is specified via engine config.
+For example, you can use "--engine-config='spec_draft_length=4;speculative_mode=EAGLE'" to
+specify the eagle-style speculative decoding.
+Check out class `EngineConfig` in mlc_llm/serve/config.py for detailed specification.
+""",
 }

@@ -5,19 +5,13 @@
 #ifndef MLC_LLM_CPP_MODEL_METADATA_H_
 #define MLC_LLM_CPP_MODEL_METADATA_H_
 
+#include <picojson.h>
 #include <tvm/runtime/container/shape_tuple.h>
 #include <tvm/runtime/container/string.h>
 #include <tvm/runtime/data_type.h>
 #include <tvm/runtime/module.h>
 
 #include <unordered_map>
-
-// Forward declare picojson's value, object and array
-namespace picojson {
-class value;
-using object = std::unordered_map<std::string, value>;
-using array = std::vector<value>;
-}  // namespace picojson
 
 namespace mlc {
 namespace llm {
@@ -38,6 +32,14 @@ struct ModelMetadata {
     static Param FromJSON(const picojson::object& param_obj, const picojson::object& model_config);
   };
 
+  struct KVCacheMetadata {
+    int64_t num_hidden_layers;
+    int64_t num_attention_heads;
+    int64_t num_key_value_heads;
+    int64_t head_dim;
+    static KVCacheMetadata FromJSON(const picojson::object& json);
+  };
+
   std::string model_type;
   std::string quantization;
   int64_t context_window_size;
@@ -47,6 +49,7 @@ struct ModelMetadata {
   int64_t attention_sink_size;
   std::vector<Param> params;
   std::unordered_map<std::string, int64_t> memory_usage;
+  KVCacheMetadata kv_cache_metadata;
 
   static ModelMetadata FromJSON(const picojson::object& json_str,
                                 const picojson::object& model_config);

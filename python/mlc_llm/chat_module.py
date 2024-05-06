@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import tvm
 from tvm.runtime import disco  # pylint: disable=unused-import
 
+from mlc_llm.protocol.conversation_protocol import Conversation
 from mlc_llm.support import logging
 from mlc_llm.support.auto_device import detect_device
 from mlc_llm.support.config import ConfigBase
@@ -23,7 +24,7 @@ from mlc_llm.support.config import ConfigBase
 from . import base as _
 
 if TYPE_CHECKING:
-    from mlc_llm.interface.openai_api import ChatMessage
+    from mlc_llm.protocol.openai_api_protocol import ChatCompletionMessage
 
 # pylint: disable=line-too-long
 _PYTHON_GET_STARTED_TUTORIAL_URL = "https://github.com/mlc-ai/notebooks/blob/main/mlc-llm/tutorial_chat_module_getting_started.ipynb"
@@ -44,58 +45,61 @@ class ConvConfig:  # pylint: disable=too-many-instance-attributes
 
     Since the configuration is partial, everything will be ``Optional``.
 
+    The parameters are the same as :class:`mlc_llm.protocol.conversation_protocol.Conversation`
+
     Parameters
     ----------
     name : Optional[str]
         Name of the conversation.
-    system : Optional[str]
-        The prompt encoded before starting the chat.
-    roles : Optional[List[str]]
-        An array that describes the role names of the user and the model. These
-        names are specific to the model being used.
-    messages : Optional[List[List[str]]]
-        The chat history represented as an array of string pairs in the following
-        format: ``[[role_0, msg_0], [role_1, msg_1], ...]``.
-    offset : Optional[int]
-        The offset used to begin the chat from the chat history. When offset
-        is not ``0``, ``messages[0:offset-1]`` will be encoded.
-    separator_style : Optional[int]
-        Specifies whether we are in chat-bot mode (``0``) or pure LM prompt mode (``1``).
+    system_template : Optional[str]
+        The system prompt template, it optionally contains the system
+        message placeholder, and the placeholder will be replaced with
+        the system message below.
+    system_message : Optional[str]
+        The content of the system prompt (without the template format).
+    system_prefix_token_ids : Optional[List[int]]
+        The system token ids to be prepended at the beginning of tokenized
+        generated prompt.
+    roles : Optional[Dict[str, str]]
+        The conversation roles
+    role_templates : Optional[Dict[str, str]]
+        The roles prompt template, it optionally contains the defaults
+        message placeholders and will be replaced by actual content
+    messages : Optional[List[Tuple[str, Optional[str]]]]
+        The conversation history messages.
+        Each message is a pair of strings, denoting "(role, content)".
+        The content can be None.
     seps : Optional[List[str]]
         An array of strings indicating the separators to be used after a user
         message and a model message respectively.
-    role_msg_sep : Optional[str]
-        A string indicating the separator between a role and a message.
+    role_content_sep : Optional[str]
+        The separator between the role and the content in a message.
     role_empty_sep : Optional[str]
-        A string indicating the separator to append to a role when there is no message yet.
-    stop_str : Optional[str]
+        The separator between the role and empty contents.
+    stop_str : Optional[List[str]]
         When the ``stop_str`` is encountered, the model will stop generating output.
-    stop_tokens : Optional[List[int]]
+    stop_token_ids : Optional[List[int]]
         A list of token IDs that act as stop tokens.
-    prefix_tokens : Optional[List[int]]
-        Token list prefixing the conversation.
-    add_bos : Optional[bool]
-        Determines whether a beginning-of-string (bos) token should be added
-        before the input tokens.
+    function_string : Optional[str]
+        The function calling string.
+    use_function_calling : Optional[bool]
+        Whether using function calling or not, helps check for output message format in API call.
     """
 
     name: Optional[str] = None
-    system: Optional[str] = None
-    roles: Optional[List[str]] = None
-    messages: Optional[List[List[str]]] = None
-    offset: Optional[int] = None
-    separator_style: Optional[int] = None
+    system_template: Optional[str] = None
+    system_message: Optional[str] = None
+    system_prefix_token_ids: Optional[List[int]] = None
+    roles: Optional[Dict[str, str]] = None
+    role_templates: Optional[Dict[str, str]] = None
+    messages: Optional[List[Tuple[str, Optional[str]]]] = None
     seps: Optional[List[str]] = None
-    role_msg_sep: Optional[str] = None
+    role_content_sep: Optional[str] = None
     role_empty_sep: Optional[str] = None
-    stop_str: Optional[str] = None
-    stop_tokens: Optional[List[int]] = None
-    prefix_tokens: Optional[List[int]] = None
-    add_bos: Optional[bool] = None
-
-    def __post_init__(self):
-        if self.messages is not None and self.offset is None:
-            self.offset = len(self.messages)
+    stop_str: Optional[List[str]] = None
+    stop_token_ids: Optional[List[int]] = None
+    function_string: Optional[str] = None
+    use_function_calling: Optional[bool] = None
 
 
 @dataclass
@@ -192,7 +196,7 @@ class ChatConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
 
     model_lib: Optional[str] = None
     local_id: Optional[str] = None
-    conv_template: Optional[str] = None
+    conv_template: Optional[Union[str, Conversation]] = None
     temperature: Optional[float] = None
     presence_penalty: Optional[float] = 0.0
     frequency_penalty: Optional[float] = 0.0
@@ -217,6 +221,8 @@ class ChatConfig(ConfigBase):  # pylint: disable=too-many-instance-attributes
 
     @classmethod
     def _from_json(cls, json_obj: dict):
+        if "conv_template" in json_obj and isinstance(json_obj["conv_template"], dict):
+            json_obj["conv_template"] = Conversation.from_json_dict(json_obj["conv_template"])
         return cls(**{k: v for k, v in json_obj.items() if k in inspect.signature(cls).parameters})
 
 
@@ -436,8 +442,15 @@ def _get_chat_config(config_file_path: str, user_chat_config: Optional[ChatConfi
                 if field_name == "model_lib":
                     warn_msg = (
                         'WARNING: Do not override "model_lib" in ChatConfig. '
-                        "This override will be ignored. Please use ChatModule.model_lib_path to "
+                        "This override will be ignored. Please use ChatModule.model_lib to "
                         "override the full model library path instead."
+                    )
+                    warnings.warn(warn_msg)
+                elif field_name == "conv_template" and isinstance(field_value, Conversation):
+                    warn_msg = (
+                        'WARNING: Do not override "conv_template" in ChatConfig. '
+                        'Please override "conv_config" instead.'
+                        "This override will be ignored."
                     )
                     warnings.warn(warn_msg)
                 else:
@@ -480,7 +493,7 @@ def _get_lib_module_path(  # pylint: disable=too-many-arguments
     model: str,
     model_path: str,
     chat_config: ChatConfig,
-    model_lib_path: Optional[str],
+    model_lib: Optional[str],
     device_name: str,
     config_file_path: str,
 ) -> str:
@@ -494,7 +507,7 @@ def _get_lib_module_path(  # pylint: disable=too-many-arguments
         Model path found by `_get_model_path`.
     chat_config : ChatConfig
         Chat config after potential overrides. Returned by ``_get_chat_config``.
-    model_lib_path : Optional[str]
+    model_lib : Optional[str]
         User's input. Supposedly a full path to model library. Prioritized to use.
     device_name : str
         User's input. Used to construct the library model file name.
@@ -503,20 +516,20 @@ def _get_lib_module_path(  # pylint: disable=too-many-arguments
 
     Returns
     -------
-    model_lib_path : str
+    model_lib : str
         The path pointing to the model library we find.
 
     Raises
     ------
     FileNotFoundError: if we cannot find a valid model library file.
     """
-    # 1. Use user's model_lib_path if provided
-    if model_lib_path is not None:
-        if os.path.isfile(model_lib_path):
-            logger.info("Using library model: %s", model_lib_path)
-            return model_lib_path
+    # 1. Use user's model_lib if provided
+    if model_lib is not None:
+        if os.path.isfile(model_lib):
+            logger.info("Using library model: %s", model_lib)
+            return model_lib
         raise FileNotFoundError(
-            f"The `model_lib_path` you passed in is not a file: {model_lib_path}.\n"
+            f"The `model_lib` you passed in is not a file: {model_lib}.\n"
             f"Please refer to {_PYTHON_GET_STARTED_TUTORIAL_URL} as tutorial on model loading."
         )
 
@@ -571,7 +584,7 @@ def _get_lib_module_path(  # pylint: disable=too-many-arguments
         err_msg += f"- {candidate}\n"
     err_msg += (
         "If you would like to directly specify the model library path, you may "
-        "consider passing in the `ChatModule.model_lib_path` parameter.\n"
+        "consider passing in the `ChatModule.model_lib` parameter.\n"
         f"Please checkout {_PYTHON_GET_STARTED_TUTORIAL_URL} for an example "
         "on how to load a model."
     )
@@ -613,6 +626,9 @@ def _convert_chat_config_to_json_str(
                     conv_dict[conv_k] = conv_v
             chat_dict[key] = conv_dict
             continue
+        if key == "conv_template" and isinstance(value, Conversation):
+            chat_dict[key] = Conversation.to_json_dict(value)
+            continue
         if value is not None:
             chat_dict[key] = value
 
@@ -638,17 +654,17 @@ def _convert_generation_config_to_json_str(generation_config: Optional[Generatio
     return json.dumps(asdict(generation_config))
 
 
-def _inspect_model_lib_metadata_memory_usage(model_lib_path, config_file_path):
+def _inspect_model_lib_metadata_memory_usage(model_lib, config_file_path):
     cmd = [
         sys.executable,
         "-m",
         "mlc_llm.cli.model_metadata",
-        model_lib_path,
+        model_lib,
         "--memory-only",
         "--mlc-chat-config",
         config_file_path,
     ]
-    subprocess.run(cmd, check=False)
+    subprocess.run(cmd, check=False, env=os.environ)
 
 
 class ChatModule:  # pylint: disable=too-many-instance-attributes
@@ -700,7 +716,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
         A ``ChatConfig`` instance partially filled. Will be used to override the
         ``mlc-chat-config.json``.
 
-    model_lib_path : Optional[str]
+    model_lib : Optional[str]
         The full path to the model library file to use (e.g. a ``.so`` file).
         If unspecified, we will use the provided ``model`` to search over
         possible paths.
@@ -711,7 +727,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
         model: str,
         device: str = "auto",
         chat_config: Optional[ChatConfig] = None,
-        model_lib_path: Optional[str] = None,
+        model_lib: Optional[str] = None,
     ):
         # 0. Get device:
         # Retrieve device_name and device_id (if any, default 0) from device arg
@@ -752,37 +768,37 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
         self.chat_config = _get_chat_config(self.config_file_path, chat_config)
 
         # 4. Look up model library
-        try:
-            self.model_lib_path = _get_lib_module_path(
+        if model_lib is not None:
+            self.model_lib = _get_lib_module_path(
                 model,
                 self.model_path,
                 self.chat_config,
-                model_lib_path,
+                model_lib,
                 self.device.MASK2STR[self.device.device_type],
                 self.config_file_path,
             )
-        except FileNotFoundError:
-            logger.info("Model lib not found. Now compiling model lib on device...")
+        else:
+            logger.info("Now compiling model lib on device...")
             from mlc_llm.interface import jit  # pylint: disable=import-outside-toplevel
 
-            self.model_lib_path = str(
+            self.model_lib = str(
                 jit.jit(
                     model_path=Path(self.model_path),
                     chat_config=asdict(self.chat_config),
                     device=self.device,
                 )
             )
-        _inspect_model_lib_metadata_memory_usage(self.model_lib_path, self.config_file_path)
+        _inspect_model_lib_metadata_memory_usage(self.model_lib, self.config_file_path)
 
         # 5. Call reload
         user_chat_config_json_str = _convert_chat_config_to_json_str(
             self.chat_config, self.chat_config.conv_template
         )
-        self._reload(self.model_lib_path, self.model_path, user_chat_config_json_str)
+        self._reload(self.model_lib, self.model_path, user_chat_config_json_str)
 
     def generate(
         self,
-        prompt: Union[str, List["ChatMessage"]],
+        prompt: Union[str, List["ChatCompletionMessage"]],
         generation_config: Optional[GenerationConfig] = None,
         progress_callback=None,
         stateless=False,
@@ -793,7 +809,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
 
         Parameters
         ----------
-        prompt: Union[str, List[ChatMessage]]
+        prompt: Union[str, List[ChatCompletionMessage]]
             The user input prompt, i.e. a question to ask the chat module.
             It can also be the whole conversation history (list of messages with role and content)
             eg:
@@ -801,9 +817,10 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
             .. code::
 
                 [
-                    ChatMessage(role="user", content="Hello, how are you?"),
-                    ChatMessage(role="assistant", content="I'm fine, thank you. How about you?"),
-                    ChatMessage(role="user", content="I'm good too."),
+                    ChatCompletionMessage(role="user", content="Hello, how are you?"),
+                    ChatCompletionMessage(role="assistant", \
+                        content="I'm fine, thank you. How about you?"),
+                    ChatCompletionMessage(role="user", content="I'm good too."),
                 ]
         generation_config: Optional[GenerationConfig]
             The generation config object to override the ChatConfig generation settings.
@@ -1005,7 +1022,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
 
     def _prefill(
         self,
-        input: Union[str, List["ChatMessage"]],  # pylint: disable=redefined-builtin
+        input: Union[str, List["ChatCompletionMessage"]],  # pylint: disable=redefined-builtin
         decode_next_token: bool = True,
         place_in_prompt: PlaceInPrompt = PlaceInPrompt.All,
         generation_config: Optional[GenerationConfig] = None,
@@ -1015,7 +1032,7 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
 
         Parameters
         ----------
-        input : Union[str, List[ChatMessage]]
+        input : Union[str, List[ChatCompletionMessage]]
             The user input prompt, i.e. a question to ask the chat module.
             It can also be the whole conversation history (list of messages with role and content)
             eg:
@@ -1023,9 +1040,10 @@ class ChatModule:  # pylint: disable=too-many-instance-attributes
             .. code::
 
                 [
-                    ChatMessage(role="user", content="Hello, how are you?"),
-                    ChatMessage(role="assistant", content="I'm fine, thank you. How about you?"),
-                    ChatMessage(role="user", content="I'm good too."),
+                    ChatCompletionMessage(role="user", content="Hello, how are you?"),
+                    ChatCompletionMessage(role="assistant", \
+                        content="I'm fine, thank you. How about you?"),
+                    ChatCompletionMessage(role="user", content="I'm good too."),
                 ]
         decode_next_token : bool
             Whether to decode the next token after prefilling.

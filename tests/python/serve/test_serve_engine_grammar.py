@@ -1,14 +1,15 @@
 # pylint: disable=chained-comparison,line-too-long,missing-docstring,
 # pylint: disable=too-many-arguments,too-many-locals,unused-argument,unused-variable
 import asyncio
+import json
 from typing import List
 
 import pytest
+from pydantic import BaseModel
 
-from mlc_llm.serve import Engine, GenerationConfig, KVCacheConfig
-from mlc_llm.serve.async_engine import AsyncThreadedEngine
+from mlc_llm.serve import AsyncMLCEngine, GenerationConfig
 from mlc_llm.serve.config import ResponseFormat
-from mlc_llm.serve.engine import ModelInfo
+from mlc_llm.serve.sync_engine import SyncMLCEngine
 
 prompts_list = [
     "Generate a JSON string containing 20 objects:",
@@ -16,17 +17,15 @@ prompts_list = [
     "Generate a JSON with 5 elements:",
 ]
 model_path = "dist/Llama-2-7b-chat-hf-q4f16_1-MLC"
-model_lib_path = "dist/libs/Llama-2-7b-chat-hf-q4f16_1-cuda.so"
+model_lib = "dist/libs/Llama-2-7b-chat-hf-q4f16_1-cuda.so"
 
 
 def test_batch_generation_with_grammar():
-    # Initialize model loading info and KV cache config
-    model = ModelInfo(model_path, model_lib_path=model_lib_path)
-    kv_cache_config = KVCacheConfig(page_size=16)
     # Create engine
-    engine = Engine(model, kv_cache_config)
+    engine = SyncMLCEngine(model=model_path, model_lib=model_lib, mode="server")
 
-    prompts = prompts_list * 2
+    prompt_len = len(prompts_list)
+    prompts = prompts_list * 3
 
     temperature = 1
     repetition_penalty = 1
@@ -45,7 +44,17 @@ def test_batch_generation_with_grammar():
         stop_token_ids=[2],
         response_format=ResponseFormat(type="json_object"),
     )
-    all_generation_configs = [generation_config_no_json] * 3 + [generation_config_json] * 3
+    generation_config_json_no_stop_token = GenerationConfig(
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        max_tokens=max_tokens,
+        response_format=ResponseFormat(type="json_object"),
+    )
+    all_generation_configs = (
+        [generation_config_no_json] * prompt_len
+        + [generation_config_json] * prompt_len
+        + [generation_config_json_no_stop_token] * prompt_len
+    )
 
     # Generate output.
     output_texts, _ = engine.generate(prompts, all_generation_configs)
@@ -58,12 +67,61 @@ def test_batch_generation_with_grammar():
                 print(f"Output {req_id}({i}):{output}\n")
 
 
-async def run_async_engine():
-    # Initialize model loading info and KV cache config
-    model = ModelInfo(model_path, model_lib_path=model_lib_path)
-    kv_cache_config = KVCacheConfig(page_size=16)
+def test_batch_generation_with_schema():
     # Create engine
-    async_engine = AsyncThreadedEngine(model, kv_cache_config, enable_tracing=True)
+    engine = SyncMLCEngine(model=model_path, model_lib=model_lib, mode="server")
+
+    prompt = (
+        "Generate a json containing three fields: an integer field named size, a "
+        "boolean field named is_accepted, and a float field named num:"
+    )
+    repeat_cnt = 3
+    prompts = [prompt] * repeat_cnt * 2
+
+    temperature = 1
+    repetition_penalty = 1
+    max_tokens = 512
+    generation_config_no_json = GenerationConfig(
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        max_tokens=max_tokens,
+        stop_token_ids=[2],
+        response_format=ResponseFormat(type="text"),
+    )
+
+    class Schema(BaseModel):
+        size: int
+        is_accepted: bool
+        num: float
+
+    schema_str = json.dumps(Schema.model_json_schema())
+
+    generation_config_json = GenerationConfig(
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        max_tokens=max_tokens,
+        stop_token_ids=[2],
+        response_format=ResponseFormat(type="json_object", schema=schema_str),
+    )
+
+    all_generation_configs = [generation_config_no_json] * repeat_cnt + [
+        generation_config_json
+    ] * repeat_cnt
+
+    # Generate output.
+    output_texts, _ = engine.generate(prompts, all_generation_configs)
+    for req_id, outputs in enumerate(output_texts):
+        print(f"Prompt {req_id}: {prompts[req_id]}")
+        if len(outputs) == 1:
+            print(f"Output {req_id}: {outputs[0]}\n")
+        else:
+            for i, output in enumerate(outputs):
+                print(f"Output {req_id}({i}): {output}\n")
+
+
+async def run_async_engine():
+    # Create engine
+    async_engine = AsyncMLCEngine(model=model_path, model_lib=model_lib, mode="server")
 
     prompts = prompts_list * 20
 
@@ -84,14 +142,14 @@ async def run_async_engine():
     ]
 
     async def generate_task(
-        async_engine: AsyncThreadedEngine,
+        async_engine: AsyncMLCEngine,
         prompt: str,
         generation_cfg: GenerationConfig,
         request_id: str,
     ):
         print(f"Start generation task for request {request_id}")
         rid = int(request_id)
-        async for delta_outputs in async_engine.generate(
+        async for delta_outputs in async_engine._generate(
             prompt, generation_cfg, request_id=request_id
         ):
             assert len(delta_outputs) == generation_cfg.n
@@ -117,8 +175,6 @@ async def run_async_engine():
             for i, output in enumerate(outputs):
                 print(f"Output {req_id}({i}):{output}\n")
 
-    print(async_engine.trace_recorder.dump_json(), file=open("tmpfiles/tmp.json", "w"))
-
     async_engine.terminate()
 
 
@@ -133,7 +189,7 @@ def test_generation_config_error():
             repetition_penalty=1.0,
             max_tokens=128,
             stop_token_ids=[2],
-            response_format=ResponseFormat(type="text", json_schema="{}"),
+            response_format=ResponseFormat(type="text", schema="{}"),
         )
 
 

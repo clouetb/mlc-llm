@@ -13,16 +13,43 @@
 #include <tvm/runtime/packed_func.h>
 #include <tvm/runtime/registry.h>
 
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
 
 #include "../support/load_bytes_from_file.h"
+#include "../support/utils.h"
 #include "sampler/sampler.h"
 
 namespace mlc {
 namespace llm {
 namespace serve {
+
+Optional<IntTuple> GetDiscoWorkerCPUBinding(int num_workers) {
+  const char* raw_cpu_binding = std::getenv("MLC_DISCO_WORKER_CPU_BINDING");
+  if (raw_cpu_binding == nullptr) {
+    return NullOpt;
+  }
+
+  std::string cpu_binding_str(raw_cpu_binding);
+  std::vector<std::string> cpu_ids_str = Split(cpu_binding_str, ',');
+  std::vector<int64_t> cpu_ids;
+  for (const std::string& cpu_id_str : cpu_ids_str) {
+    try {
+      cpu_ids.push_back(std::stol(cpu_id_str));
+    } catch (std::invalid_argument const& ex) {
+      LOG(FATAL) << "Invalid MLC_DISCO_WORKER_CPU_BINDING \"" << cpu_binding_str << "\"";
+    }
+  }
+  if (static_cast<int>(cpu_ids.size()) < num_workers) {
+    LOG(FATAL) << "Insufficient number of specified CPU workers in MLC_DISCO_WORKER_CPU_BINDING, "
+                  "expecting at least "
+               << num_workers << "CPU ids but only " << cpu_ids.size() << " are given.";
+  }
+
+  return IntTuple{cpu_ids};
+}
 
 PackedFunc FunctionTable::SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name) {
   return PackedFunc([sess, func = std::move(sess_func), name = std::move(name)](
@@ -42,7 +69,8 @@ PackedFunc FunctionTable::SessionFuncAsPackedFunc(Session sess, DRef sess_func, 
   });
 }
 
-void FunctionTable::Init(TVMArgValue reload_lib, Device device, picojson::object model_config) {
+void FunctionTable::Init(String reload_lib_path, Device device, picojson::object model_config,
+                         Optional<Session> session) {
   local_gpu_device = device;
   Device null_device{DLDeviceType(0), 0};
   int num_shards;
@@ -58,48 +86,24 @@ void FunctionTable::Init(TVMArgValue reload_lib, Device device, picojson::object
   this->cached_buffers = Map<String, ObjectRef>();
 
   if (num_shards > 1) {
-    String lib_path{nullptr};
-    try {
-      lib_path = reload_lib.operator String();
-    } catch (...) {
-      LOG(FATAL)
-          << "ValueError: In multi-GPU inference, we expect the first argument to Reload to be a "
-             "string path to the model library (.so on Linux or .dll on Windows), but got: "
-          << ArgTypeCode2Str(reload_lib.type_code());
-    }
-    constexpr const char* f_create_process_pool = "runtime.disco.create_process_pool";
-    if (Registry::Get(f_create_process_pool) == nullptr) {
-      LOG(FATAL) << "Cannot find process launcher `" << f_create_process_pool << "`. "
-                 << "Multi-GPU inference depends on MLC LLM Python API to launch process.";
-    }
-    std::string ccl;
-    if (device.device_type == kDLCUDA) {
-      ccl = "nccl";
-    } else if (device.device_type == kDLROCM) {
-      ccl = "rccl";
-    } else {
-      LOG(FATAL) << "ValueError: Multi-GPU on device " << DLDeviceType2Str(device.device_type)
-                 << " is not supported. Currently, only NCCL and RCCL are integrated.";
-    }
-    std::vector<int64_t> device_ids(num_shards);
-    for (int i = 0; i < num_shards; ++i) {
-      device_ids[i] = i;
-    }
+    this->sess = session.value();
     this->use_disco = true;
-    this->sess = Session::ProcessSession(num_shards, f_create_process_pool, "mlc_llm.cli.worker");
-    this->sess->InitCCL(ccl, ShapeTuple(device_ids));
     this->disco_mod = sess->CallPacked(sess->GetGlobalFunc("runtime.disco.load_vm_module"),
-                                       lib_path, null_device);
+                                       reload_lib_path, null_device);
     this->mod_get_func = [this,
                           fmodule_get_function = sess->GetGlobalFunc("runtime.ModuleGetFunction")](
                              const std::string& name) -> PackedFunc {
-      DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, false);
+      DRef func = sess->CallPacked(fmodule_get_function, this->disco_mod, name, true);
       bool exists = (func->DebugGetFromRemote(0).operator PackedFunc()) != nullptr;
       if (!exists) {
         return PackedFunc(nullptr);
       }
       return SessionFuncAsPackedFunc(sess, func, name);
     };
+    if (Optional<IntTuple> cpu_ids = GetDiscoWorkerCPUBinding(/*num_workers=*/num_shards)) {
+      IntTuple cpu_ids_value = cpu_ids.value();
+      sess->CallPacked(sess->GetGlobalFunc("runtime.disco.bind_worker_to_cpu_core"), cpu_ids_value);
+    }
     this->get_global_func = [this](const std::string& name) -> PackedFunc {
       return SessionFuncAsPackedFunc(sess, sess->GetGlobalFunc(name), name);
     };
@@ -108,22 +112,30 @@ void FunctionTable::Init(TVMArgValue reload_lib, Device device, picojson::object
     this->_InitFunctions();
   } else {
     Module executable{nullptr};
-    if (reload_lib.type_code() == kTVMModuleHandle) {
-      executable = reload_lib.operator Module();
+    PackedFunc fload_exec{nullptr};
+    if (StartsWith(reload_lib_path, "system://")) {
+      const PackedFunc* f_load_system_lib = Registry::Get("runtime.SystemLib");
+      ICHECK_NOTNULL(f_load_system_lib);
+      std::string system_lib_prefix = std::string(reload_lib_path).substr(9);
+      std::replace(system_lib_prefix.begin(), system_lib_prefix.end(), /*old=*/'-', /*new=*/'_');
+      executable = (*f_load_system_lib)(system_lib_prefix + "_");
+      fload_exec = executable->GetFunction("vm_load_executable");
+      ICHECK(fload_exec.defined())
+          << "Cannot find system lib with " << system_lib_prefix
+          << ", please make sure you set model_lib field consistently with the compilation ";
     } else {
-      String lib_path = reload_lib.operator String();
-      executable = tvm::runtime::Module::LoadFromFile(lib_path);
+      executable = tvm::runtime::Module::LoadFromFile(reload_lib_path);
+      fload_exec = executable->GetFunction("vm_load_executable");
+      ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
     }
     this->use_disco = false;
-    auto fload_exec = executable->GetFunction("vm_load_executable");
-    ICHECK(fload_exec.defined()) << "TVM runtime cannot find vm_load_executable";
     this->local_vm = fload_exec();
     this->local_vm->GetFunction("vm_initialization")(
         static_cast<int>(device.device_type), device.device_id,
         static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled), static_cast<int>(kDLCPU), 0,
         static_cast<int>(tvm::runtime::memory::AllocatorType::kPooled));
     this->mod_get_func = [this](const std::string& name) -> PackedFunc {
-      return this->local_vm->GetFunction(name, false);
+      return this->local_vm->GetFunction(name, true);
     };
     this->get_global_func = [](const std::string& name) -> PackedFunc {
       const auto* f = tvm::runtime::Registry::Get(name);
@@ -191,12 +203,22 @@ ObjectRef FunctionTable::LoadParams(const std::string& model_path, Device device
 
 void FunctionTable::_InitFunctions() {
   this->embed_func_ = mod_get_func("embed");
+  this->image_embed_func_ = mod_get_func("image_embed");
   this->single_batch_prefill_func_ = mod_get_func("prefill");
   this->single_batch_decode_func_ = mod_get_func("decode");
   this->prefill_func_ = mod_get_func("batch_prefill");
   this->decode_func_ = mod_get_func("batch_decode");
   this->verify_func_ = mod_get_func("batch_verify");
+  this->single_batch_prefill_to_last_hidden_func_ = mod_get_func("prefill_to_last_hidden_states");
+  this->single_batch_decode_to_last_hidden_func_ = mod_get_func("decode_to_last_hidden_states");
+  this->prefill_to_last_hidden_func_ = mod_get_func("batch_prefill_to_last_hidden_states");
+  this->decode_to_last_hidden_func_ = mod_get_func("batch_decode_to_last_hidden_states");
+  this->verify_to_last_hidden_func_ = mod_get_func("batch_verify_to_last_hidden_states");
+  this->fuse_embed_hidden_func_ = mod_get_func("fuse_embed_hidden_states");
   Module mod = this->use_disco ? this->disco_mod->DebugGetFromRemote(0) : this->local_vm;
+  this->get_logits_func_ = mod_get_func("get_logits");
+  this->batch_get_logits_func_ = mod_get_func("batch_get_logits");
+  this->batch_select_last_hidden_func_ = mod_get_func("batch_select_last_hidden_states");
   this->softmax_func_ = mod->GetFunction("softmax_with_temperature", true);
   this->apply_logit_bias_func_ = mod->GetFunction("apply_logit_bias_inplace", true);
   this->apply_penalty_func_ = mod->GetFunction("apply_penalty_inplace", true);
@@ -204,34 +226,45 @@ void FunctionTable::_InitFunctions() {
   this->alloc_embedding_tensor_func_ = mod_get_func("alloc_embedding_tensor");
   this->create_kv_cache_func_ = mod_get_func("create_flashinfer_paged_kv_cache");
   if (!this->create_kv_cache_func_.defined()) {
-    this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+    PackedFunc f_create_rnn_state = mod_get_func("create_rnn_state");
+    if (f_create_rnn_state.defined()) {
+      this->create_kv_cache_func_ = f_create_rnn_state;
+    } else {
+      this->create_kv_cache_func_ = mod_get_func("create_tir_paged_kv_cache");
+    }
     ICHECK(this->create_kv_cache_func_.defined());
   }
-  this->reset_kv_cache_func_ = get_global_func("vm.builtin.paged_attention_kv_cache_clear");
-  this->kv_cache_add_sequence_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_add_sequence");
-  this->kv_cache_fork_sequence_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_fork_sequence");
-  this->kv_cache_remove_sequence_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_remove_sequence");
-  this->kv_cache_begin_forward_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_begin_forward");
-  this->kv_cache_end_forward_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_end_forward");
-  this->kv_cache_attention_func_ = get_global_func("vm.builtin.paged_attention_kv_cache_attention");
-  this->kv_cache_popn_func_ = get_global_func("vm.builtin.paged_attention_kv_cache_popn");
+  this->reset_kv_cache_func_ = get_global_func("vm.builtin.kv_state_clear");
+  this->kv_cache_add_sequence_func_ = get_global_func("vm.builtin.kv_state_add_sequence");
+  this->kv_cache_fork_sequence_func_ = get_global_func("vm.builtin.kv_state_fork_sequence");
+  this->kv_cache_enable_sliding_window_for_seq_ =
+      get_global_func("vm.builtin.attention_kv_cache_enable_sliding_window_for_seq");
+  this->kv_cache_remove_sequence_func_ = get_global_func("vm.builtin.kv_state_remove_sequence");
+  this->kv_cache_begin_forward_func_ = get_global_func("vm.builtin.kv_state_begin_forward");
+  this->kv_cache_end_forward_func_ = get_global_func("vm.builtin.kv_state_end_forward");
+  this->kv_cache_popn_func_ = get_global_func("vm.builtin.kv_state_popn");
   this->kv_cache_get_num_available_pages_func_ =
-      get_global_func("vm.builtin.paged_attention_kv_cache_get_num_available_pages");
+      *tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_get_num_available_pages");
+  this->kv_cache_get_total_sequence_length_func_ =
+      *tvm::runtime::Registry::Get("vm.builtin.attention_kv_cache_get_total_sequence_length");
   if (Sampler::SupportGPUSampler(local_gpu_device)) {
     gpu_multinomial_from_uniform_func_ = mod->GetFunction("multinomial_from_uniform", true);
     gpu_argsort_probs_func_ = mod->GetFunction("argsort_probs", true);
     gpu_sample_with_top_p_func_ = mod->GetFunction("sample_with_top_p", true);
     gpu_sampler_take_probs_func_ = mod->GetFunction("sampler_take_probs", true);
+    gpu_verify_draft_tokens_func_ = mod->GetFunction("sampler_verify_draft_tokens", true);
+    gpu_renormalize_by_top_p_func_ = mod->GetFunction("renormalize_by_top_p", true);
   }
   this->nd_view_func_ = get_global_func("vm.builtin.reshape");
   this->nd_get_shape_func_ = get_global_func("vm.builtin.shape_of");
   this->nd_copy_embedding_to_offset_func_ = get_global_func("mlc.copy_embedding_to_offset");
   support_backtracking_kv_ = true;
+  this->tuple_getitem_func_ = get_global_func("vm.builtin.tuple_getitem");
+
+  this->gather_probs_func_ = mod->GetFunction("gather_probs", true);
+  this->scatter_probs_func_ = mod->GetFunction("scatter_probs", true);
+  this->gather_hidden_states_func_ = mod_get_func("gather_hidden_states");
+  this->scatter_hidden_states_func_ = mod_get_func("scatter_hidden_states");
 }
 
 ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) const {
@@ -245,9 +278,8 @@ ObjectRef FunctionTable::Empty(ShapeTuple shape, DataType dtype, Device device) 
 }
 
 ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String buffer_cache_key,
-                                       ShapeTuple max_reserved_shape) {
-  ICHECK(host_array->device.device_type == DLDeviceType::kDLCPU);
-  if (this->use_disco) {
+                                       ShapeTuple max_reserved_shape, bool local_only) {
+  if (this->use_disco && !local_only) {
     Device null_device{DLDeviceType(0), 0};
     DRef buffer(nullptr);
     auto it = this->cached_buffers.find(buffer_cache_key);
@@ -274,6 +306,16 @@ ObjectRef FunctionTable::CopyToWorker0(const NDArray& host_array, String buffer_
     DLTensor copy_dst = *(buffer.operator->());
     NDArray::CopyFromTo(host_array.operator->(), &copy_dst);
     return buffer;
+  }
+}
+
+void FunctionTable::DebugCallFuncOnAllAllWorker(const String& func_name) const {
+  if (this->use_disco) {
+    sess->CallPacked(sess->GetGlobalFunc(func_name));
+  } else {
+    const PackedFunc* func = Registry::Get(func_name);
+    CHECK(func != nullptr) << "Global function name \"" << func_name << "\" is not found";
+    (*func)();
   }
 }
 

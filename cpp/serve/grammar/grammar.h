@@ -11,6 +11,7 @@
 #include <tvm/runtime/registry.h>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,7 @@ namespace mlc {
 namespace llm {
 namespace serve {
 
+using namespace tvm;
 using namespace tvm::runtime;
 
 /*!
@@ -84,6 +86,12 @@ class BNFGrammarNode : public Object {
         << "rule_id " << rule_id << " is out of bound";
     return rules_[rule_id];
   }
+  /*! \brief Get the main rule of the grammar. */
+  const Rule& GetMainRule() const {
+    DCHECK(main_rule_id_ >= 0 && main_rule_id_ < static_cast<int32_t>(rules_.size()))
+        << "main_rule_id " << main_rule_id_ << " is out of bound";
+    return rules_[main_rule_id_];
+  }
 
   /*! \brief The type of the rule expr. */
   enum class RuleExprType : int32_t {
@@ -149,6 +157,8 @@ class BNFGrammarNode : public Object {
   /*! \brief The start index of every rule_expr in rule_expr_data_. rule_expr_id corresponds the
    * index of this vector. */
   std::vector<int32_t> rule_expr_indptr_;
+  /*! \brief The id of the main rule. */
+  int32_t main_rule_id_ = -1;
 
   friend class BNFGrammarBuilder;
   friend class BNFGrammarJSONSerializer;
@@ -161,6 +171,7 @@ class BNFGrammar : public ObjectRef {
    * \brief Construct a BNF grammar with a EBNF-formatted string. Will parse the string and
    * transform it into BNF AST.
    * \param ebnf_string The EBNF-formatted string.
+   * \param main_rule The name of the main rule.
    * \param normalize Whether to normalize the grammar. Default: true. Only set to false for the
    * purpose of testing.
    *
@@ -173,7 +184,8 @@ class BNFGrammar : public ObjectRef {
    * \param simplify Whether to simplify the grammar to make matching more efficient. Default: true.
    * Not implemented yet.
    */
-  static BNFGrammar FromEBNFString(const String& ebnf_string, bool normalize = true,
+  static BNFGrammar FromEBNFString(const std::string& ebnf_string,
+                                   const std::string& main_rule = "main", bool normalize = true,
                                    bool simplify = true);
 
   /*!
@@ -181,9 +193,31 @@ class BNFGrammar : public ObjectRef {
    * \param json_string The JSON-formatted string. This string should have the same format as
    * the result of BNFGrammarJSONSerializer::ToString.
    */
-  static BNFGrammar FromJSON(const String& json_string);
+  static BNFGrammar FromJSON(const std::string& json_string);
 
-  /*！
+  /*!
+   * \brief Construct a BNF grammar from the json schema string. The schema string should be in the
+   * format of the schema of a JSON file. We will parse the schema and generate a BNF grammar.
+   * \param schema The schema string.
+   * \param indent The number of spaces for indentation. If set to std::nullopt, the output will be
+   * in one line. Default: std::nullopt.
+   * \param separators Two separators used in the schema: comma and colon. Examples: {",", ":"},
+   * {", ", ": "}. If std::nullopt, the default separators will be used: {",", ": "} when the
+   * indent is not -1, and {", ", ": "} otherwise. This follows the convention in python
+   * json.dumps(). Default: std::nullopt.
+   * \param strict_mode Whether to use strict mode. In strict mode, the generated grammar will not
+   * allow properties and items that is not specified in the schema. This is equivalent to
+   * setting unevaluatedProperties and unevaluatedItems to false.
+   *
+   * This helps LLM to generate accurate output in the grammar-guided generation with JSON
+   * schema. Default: true.
+   */
+  static BNFGrammar FromSchema(
+      const std::string& schema, std::optional<int> indent = std::nullopt,
+      std::optional<std::pair<std::string, std::string>> separators = std::nullopt,
+      bool strict_mode = true);
+
+  /*!
    * \brief Get the grammar of standard JSON format. We have built-in support for JSON.
    */
   static BNFGrammar GetGrammarOfJSON();

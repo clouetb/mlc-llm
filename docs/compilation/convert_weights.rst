@@ -24,7 +24,7 @@ This can be extended to, e.g.:
     Before you proceed, make sure you followed :ref:`install-tvm-unity`, a required
     backend to compile models with MLC LLM.
 
-    Please also follow the instructions in :ref:`deploy-cli` / :ref:`deploy-python` to obtain
+    Please also follow the instructions in :ref:`deploy-cli` / :ref:`deploy-python-chat-module` to obtain
     the CLI app / Python API that can be used to chat with the compiled model.
     Finally, we strongly recommend you to read :ref:`project-overview` first to get
     familiarized with the high-level terminologies.
@@ -177,6 +177,6 @@ Running the distributed models are similar to running prebuilt model weights and
     python
     >>> from mlc_llm import ChatModule
     >>> cm = ChatModule(model="dist/RedPajama-INCITE-Instruct-3B-v1-q4f16_1-MLC", \
-        model_lib_path="dist/prebuilt_libs/RedPajama-INCITE-Chat-3B-v1-q4f16_1-cuda.so")  # Adjust based on backend
+        model_lib="dist/prebuilt_libs/RedPajama-INCITE-Chat-3B-v1-q4f16_1-cuda.so")  # Adjust based on backend
     >>> cm.generate("hi")
     'Hi! How can I assist you today?'

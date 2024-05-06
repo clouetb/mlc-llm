@@ -3,6 +3,8 @@
  * \file serve/engine_actions/batch_decode.cc
  */
 
+#include <tvm/runtime/nvtx.h>
+
 #include <numeric>
 
 #include "../../random.h"
@@ -40,12 +42,16 @@ class BatchDecodeActionObj : public EngineActionObj {
     }
 
     // Preempt request state entries when decode cannot apply.
-    std::vector<RequestStateEntry> running_rsentries = GetRunningRequestStateEntries(estate);
-    while (!CanDecode(running_rsentries.size())) {
-      RequestStateEntry preempted =
-          PreemptLastRunningRequestStateEntry(estate, models_, trace_recorder_);
-      if (preempted.same_as(running_rsentries.back())) {
-        running_rsentries.pop_back();
+    std::vector<RequestStateEntry> running_rsentries;
+    {
+      NVTXScopedRange nvtx_scope("BatchDecode getting requests");
+      running_rsentries = GetRunningRequestStateEntries(estate);
+      while (!CanDecode(running_rsentries.size())) {
+        RequestStateEntry preempted =
+            PreemptLastRunningRequestStateEntry(estate, models_, NullOpt, trace_recorder_);
+        if (preempted.same_as(running_rsentries.back())) {
+          running_rsentries.pop_back();
+        }
       }
     }
 
@@ -53,7 +59,8 @@ class BatchDecodeActionObj : public EngineActionObj {
 
     // NOTE: Right now we only support decode all the running request states at a time.
     int num_rsentries = running_rsentries.size();
-    estate->stats.current_total_seq_len += num_rsentries;
+    ICHECK_GT(num_rsentries, 0)
+        << "There should be at least one request state entry that can run decode";
     // Collect
     // - the last committed token,
     // - the request id,
@@ -84,7 +91,7 @@ class BatchDecodeActionObj : public EngineActionObj {
     // - Compute embeddings.
     RECORD_EVENT(trace_recorder_, request_ids, "start embedding");
     ObjectRef embeddings =
-        models_[0]->TokenEmbed({IntTuple{input_tokens.begin(), input_tokens.end()}});
+        models_[0]->TokenEmbed({IntTuple(input_tokens.begin(), input_tokens.end())});
     RECORD_EVENT(trace_recorder_, request_ids, "finish embedding");
 
     // - Invoke model decode.
@@ -107,8 +114,10 @@ class BatchDecodeActionObj : public EngineActionObj {
     // Fill range [0, num_rsentries) into `sample_indices`.
     std::vector<int> sample_indices(num_rsentries);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
-    std::vector<SampleResult> sample_results = sampler_->BatchSampleTokens(
-        probs_on_device, sample_indices, request_ids, generation_cfg, rngs);
+    NDArray renormalized_probs = sampler_->BatchRenormalizeProbsByTopP(
+        probs_on_device, sample_indices, request_ids, generation_cfg);
+    std::vector<SampleResult> sample_results = sampler_->BatchSampleTokensWithProbAfterTopP(
+        renormalized_probs, sample_indices, request_ids, generation_cfg, rngs);
     ICHECK_EQ(sample_results.size(), num_rsentries);
 
     // - Update the committed tokens of states.

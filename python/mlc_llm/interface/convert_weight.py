@@ -7,10 +7,9 @@ from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
-import numpy as np
 from tvm import tir
 from tvm.contrib import tvmjs
-from tvm.runtime import Device, NDArray
+from tvm.runtime import DataType, Device, NDArray
 from tvm.runtime import cpu as cpu_device
 from tvm.target import Target
 
@@ -76,7 +75,7 @@ def _convert_args(args: ConversionArgs) -> None:  # pylint: disable=too-many-loc
     named_params = dict(_named_params)
 
     if pre_shards_num is not None:
-        preshard_funcs = apply_preshard(quantize_map, named_params, int(pre_shards_num), args)
+        named_params, preshard_funcs = apply_preshard(named_params, int(pre_shards_num), args)
     else:
         preshard_funcs = None
 
@@ -131,7 +130,7 @@ def _convert_args(args: ConversionArgs) -> None:  # pylint: disable=too-many-loc
                 _check_param(name, param)
                 param_names.add(name)
                 param = param.copyto(cpu_device())
-                total_bytes += math.prod(param.shape) * np.dtype(param.dtype).itemsize
+                total_bytes += math.prod(param.shape) * DataType(param.dtype).itemsize()
                 yield name, param
         total_params = loader.stats.total_param_num
 

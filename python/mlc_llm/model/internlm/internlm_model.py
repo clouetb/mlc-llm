@@ -13,6 +13,7 @@ from tvm.relax.frontend.nn import Tensor, op
 from mlc_llm import op as op_ext
 from mlc_llm.nn import PagedKVCache, RopeMode
 from mlc_llm.support import logging
+from mlc_llm.support import tensor_parallel as tp
 from mlc_llm.support.config import ConfigBase
 from mlc_llm.support.style import bold
 
@@ -38,6 +39,7 @@ class InternLMConfig(ConfigBase):  # pylint: disable=too-many-instance-attribute
     prefill_chunk_size: int = 0
     tensor_parallel_shards: int = 1
     max_batch_size: int = 1
+    head_dim: int = 0
     kwargs: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
@@ -58,23 +60,24 @@ class InternLMConfig(ConfigBase):  # pylint: disable=too-many-instance-attribute
                     "`context_window_size`, `max_position_embeddings` or `max_sequence_length` is "
                     "provided in `config.json`."
                 )
+        if self.head_dim == 0:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+        assert self.head_dim * self.num_attention_heads == self.hidden_size
         if self.prefill_chunk_size == 0:
             logger.info(
-                "%s defaults to %s (%d)",
+                "%s defaults to %d",
                 bold("prefill_chunk_size"),
-                bold("context_window_size"),
-                self.context_window_size,
+                min(self.context_window_size, 2048),
             )
-            self.prefill_chunk_size = self.context_window_size
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
         elif self.prefill_chunk_size > self.context_window_size:
             logger.info(
-                "Overriding %s from %d to %d (%s)",
+                "Overriding %s from %d to %d",
                 bold("prefill_chunk_size"),
                 self.prefill_chunk_size,
-                self.context_window_size,
-                bold("context_window_size"),
+                min(self.context_window_size, 2048),
             )
-            self.prefill_chunk_size = self.context_window_size
+            self.prefill_chunk_size = min(self.context_window_size, 2048)
 
 
 # pylint: disable=invalid-name,missing-docstring
@@ -83,8 +86,8 @@ class InternLMConfig(ConfigBase):  # pylint: disable=too-many-instance-attribute
 class InternLMAttention(nn.Module):  # pylint: disable=too-many-instance-attributes
     def __init__(self, config: InternLMConfig):
         self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_heads
+        self.num_heads = config.num_attention_heads // config.tensor_parallel_shards
+        self.head_dim = config.head_dim
         self.max_position_embeddings = config.context_window_size
 
         self.wqkv_pack = nn.Linear(
@@ -106,12 +109,14 @@ class InternLMAttention(nn.Module):  # pylint: disable=too-many-instance-attribu
 
 class InternLMMLP(nn.Module):
     def __init__(self, config: InternLMConfig):
+        self.intermediate_size = config.intermediate_size // config.tensor_parallel_shards
+
         self.gate_up_proj = nn.Linear(
             in_features=config.hidden_size,
-            out_features=2 * config.intermediate_size,
+            out_features=2 * self.intermediate_size,
             bias=False,
         )
-        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x):
         concat_x1_x2 = self.gate_up_proj(x)
@@ -128,12 +133,47 @@ class InternLMDecoderLayer(nn.Module):
             config.hidden_size, -1, config.rms_norm_eps, bias=False
         )
 
+        def _set_tp():
+            def _set(layer, hint):
+                layer.attrs["shard_strategy"] = hint
+
+            hd = config.head_dim
+            q = self.self_attn.num_heads * hd
+            k = self.self_attn.num_heads * hd
+            v = self.self_attn.num_heads * hd
+            i = self.mlp.intermediate_size
+            _set(
+                self.self_attn.wqkv_pack.weight,
+                tp.ShardSingleDim("_shard_qkv_weight", dim=0, segs=[q, k, v]),
+            )
+            if config.bias:
+                _set(
+                    self.self_attn.wqkv_pack.bias,
+                    tp.ShardSingleDim("_shard_qkv_bias", dim=0, segs=[q, k, v]),
+                )
+            _set(self.self_attn.o_proj.weight, tp.ShardSingleDim("_shard_o_weight", dim=1))
+            if config.bias:
+                _set(self.self_attn.o_proj.bias, tp.ShardSingleDim("_shard_o_bias", dim=0))
+            _set(
+                self.mlp.gate_up_proj.weight,
+                tp.ShardSingleDim("_shard_mlp_gate_up", segs=[i, i], dim=0),
+            )
+            _set(self.mlp.down_proj.weight, tp.ShardSingleDim("_shard_mlp_down_proj", dim=1))
+
+        self.tensor_parallel_shards = config.tensor_parallel_shards
+        _set_tp()
+
     def forward(self, hidden_states: Tensor, paged_kv_cache: PagedKVCache, layer_id: int):
         out = self.self_attn(self.input_layernorm(hidden_states), paged_kv_cache, layer_id)
-        hidden_states = out + hidden_states
+        hidden_states = self._apply_residual(out, residual=hidden_states)
         out = self.mlp(self.post_attention_layernorm(hidden_states))
-        hidden_states = out + hidden_states
+        hidden_states = self._apply_residual(out, residual=hidden_states)
         return hidden_states
+
+    def _apply_residual(self, out, residual):
+        if self.tensor_parallel_shards > 1:
+            return op.ccl_allreduce(out, "sum") + residual
+        return out + residual
 
 
 class InternLMModel(nn.Module):
@@ -160,7 +200,7 @@ class InternLMForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
         self.num_hidden_layers = config.num_hidden_layers
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
-        self.head_dim = self.hidden_size // self.num_attention_heads
+        self.head_dim = config.head_dim
         self.vocab_size = config.vocab_size
         self.rope_theta = 10000
         self.tensor_parallel_shards = config.tensor_parallel_shards
@@ -188,6 +228,8 @@ class InternLMForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
         return logits
 
     def embed(self, input_ids: Tensor):
+        if self.tensor_parallel_shards > 1:
+            input_ids = op.ccl_broadcast_from_worker0(input_ids)
         return self.model.embed_tokens(input_ids)
 
     def prefill(self, input_embed: Tensor, paged_kv_cache: PagedKVCache):
@@ -216,6 +258,8 @@ class InternLMForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
     def batch_prefill(
         self, input_embeds: Tensor, logit_positions: Tensor, paged_kv_cache: PagedKVCache
     ):
+        if self.tensor_parallel_shards > 1:
+            logit_positions = op.ccl_broadcast_from_worker0(logit_positions)
         logits = self.batch_forward(input_embeds, paged_kv_cache, logit_positions)
         return logits, paged_kv_cache
 
@@ -230,18 +274,20 @@ class InternLMForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
     def softmax_with_temperature(self, logits: Tensor, temperature: Tensor):
         return op.softmax(logits / op.reshape(temperature, (temperature.shape[0], 1, 1)), axis=-1)
 
-    def create_paged_kv_cache(
+    def create_paged_kv_cache(  # pylint: disable=too-many-arguments
         self,
         max_batch_size: tir.Var,
         max_total_seq_len: tir.Var,
         prefill_chunk_size: tir.Var,
         page_size: tir.Var,
+        support_sliding_window: tir.Var,
     ) -> PagedKVCache:
         return PagedKVCache.create_generic(
             max_batch_size=max_batch_size,
             max_total_seq_len=max_total_seq_len,
             prefill_chunk_size=prefill_chunk_size,
             page_size=page_size,
+            support_sliding_window=support_sliding_window,
             num_hidden_layers=self.num_hidden_layers,
             num_attention_heads=self.num_attention_heads // self.tensor_parallel_shards,
             num_key_value_heads=self.num_attention_heads // self.tensor_parallel_shards,
@@ -315,6 +361,7 @@ class InternLMForCausalLM(nn.Module):  # pylint: disable=too-many-instance-attri
                 "max_total_seq_len": int,
                 "prefill_chunk_size": int,
                 "page_size": int,
+                "support_sliding_window": int,
                 "$": {
                     "param_mode": "none",
                     "effect_mode": "none",

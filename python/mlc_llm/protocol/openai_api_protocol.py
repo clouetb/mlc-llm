@@ -4,13 +4,16 @@ https://github.com/lm-sys/FastChat/blob/main/fastchat/protocol/openai_api_protoc
 """
 
 # pylint: disable=missing-class-docstring
+
+import json
 import time
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import shortuuid
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from mlc_llm.serve.config import ResponseFormat
+from .conversation_protocol import Conversation
+from .error_protocol import BadRequestError
 
 ################ Commons ################
 
@@ -69,7 +72,11 @@ class ModelResponse(BaseModel):
 
 class RequestResponseFormat(BaseModel):
     type: Literal["text", "json_object"] = "text"
-    json_schema: Optional[str] = None
+    json_schema: Optional[str] = Field(default=None, alias="schema")
+    """This field is named json_schema instead of schema because BaseModel defines a method called
+    schema. During construction of RequestResponseFormat, key "schema" still should be used:
+    `RequestResponseFormat(type="json_object", schema="{}")`
+    """
 
 
 class CompletionRequest(BaseModel):
@@ -77,12 +84,12 @@ class CompletionRequest(BaseModel):
     API reference: https://platform.openai.com/docs/api-reference/completions/create
     """
 
-    model: str
-    prompt: Union[str, List[int], List[Union[str, List[int]]]]
+    model: Optional[str] = None
+    prompt: Union[str, List[int]]
     best_of: int = 1
     echo: bool = False
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     logprobs: bool = False
     top_logprobs: int = 0
     logit_bias: Optional[Dict[int, float]] = None
@@ -92,17 +99,17 @@ class CompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     suffix: Optional[str] = None
-    temperature: float = 1.0
-    top_p: float = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     user: Optional[str] = None
     ignore_eos: bool = False
-    response_format: RequestResponseFormat = Field(default_factory=RequestResponseFormat)
+    response_format: Optional[RequestResponseFormat] = None
 
     @field_validator("frequency_penalty", "presence_penalty")
     @classmethod
-    def check_penalty_range(cls, penalty_value: float) -> float:
+    def check_penalty_range(cls, penalty_value: Optional[float]) -> Optional[float]:
         """Check if the penalty value is in range [-2, 2]."""
-        if penalty_value < -2 or penalty_value > 2:
+        if penalty_value and (penalty_value < -2 or penalty_value > 2):
             raise ValueError("Penalty value should be in range [-2, 2].")
         return penalty_value
 
@@ -147,7 +154,7 @@ class CompletionResponse(BaseModel):
     id: str
     choices: List[CompletionResponseChoice]
     created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
+    model: Optional[str] = None
     object: str = "text_completion"
     usage: UsageInfo = Field(
         default_factory=lambda: UsageInfo()  # pylint: disable=unnecessary-lambda
@@ -180,7 +187,7 @@ class ChatToolCall(BaseModel):
 
 
 class ChatCompletionMessage(BaseModel):
-    content: Optional[Union[str, List[Dict[str, str]]]] = None
+    content: Optional[Union[str, List[Dict]]] = None
     role: Literal["system", "user", "assistant", "tool"]
     name: Optional[str] = None
     tool_calls: Optional[List[ChatToolCall]] = None
@@ -193,9 +200,9 @@ class ChatCompletionRequest(BaseModel):
     """
 
     messages: List[ChatCompletionMessage]
-    model: str
-    frequency_penalty: float = 0.0
-    presence_penalty: float = 0.0
+    model: Optional[str] = None
+    frequency_penalty: Optional[float] = None
+    presence_penalty: Optional[float] = None
     logprobs: bool = False
     top_logprobs: int = 0
     logit_bias: Optional[Dict[int, float]] = None
@@ -204,19 +211,19 @@ class ChatCompletionRequest(BaseModel):
     seed: Optional[int] = None
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
-    temperature: float = 1.0
-    top_p: float = 1.0
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
     tools: Optional[List[ChatTool]] = None
     tool_choice: Optional[Union[Literal["none", "auto"], Dict]] = None
     user: Optional[str] = None
     ignore_eos: bool = False
-    response_format: RequestResponseFormat = Field(default_factory=RequestResponseFormat)
+    response_format: Optional[RequestResponseFormat] = None
 
     @field_validator("frequency_penalty", "presence_penalty")
     @classmethod
-    def check_penalty_range(cls, penalty_value: float) -> float:
+    def check_penalty_range(cls, penalty_value: Optional[float]) -> Optional[float]:
         """Check if the penalty value is in range [-2, 2]."""
-        if penalty_value < -2 or penalty_value > 2:
+        if penalty_value and (penalty_value < -2 or penalty_value > 2):
             raise ValueError("Penalty value should be in range [-2, 2].")
         return penalty_value
 
@@ -245,6 +252,74 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError('"logprobs" must be True to support "top_logprobs"')
         return self
 
+    def check_message_validity(self) -> None:
+        """Check if the given chat messages are valid. Return error message if invalid."""
+        for i, message in enumerate(self.messages):
+            if message.role == "system" and i != 0:
+                raise BadRequestError(
+                    f"System prompt at position {i} in the message list is invalid."
+                )
+            if message.role == "tool":
+                raise BadRequestError("Tool as the message author is not supported yet.")
+            if message.tool_call_id is not None:
+                if message.role != "tool":
+                    raise BadRequestError("Non-tool message having `tool_call_id` is invalid.")
+            if isinstance(message.content, list):
+                if message.role != "user":
+                    raise BadRequestError("Non-user message having a list of content is invalid.")
+            if message.tool_calls is not None:
+                if message.role != "assistant":
+                    raise BadRequestError("Non-assistant message having `tool_calls` is invalid.")
+                raise BadRequestError("Assistant message having `tool_calls` is not supported yet.")
+
+    def check_function_call_usage(self, conv_template: Conversation) -> None:
+        """Check if function calling is used and update the conversation template.
+        Return error message if invalid request format for function calling.
+        """
+
+        # return if no tools are provided or tool_choice is set to none
+        if self.tools is None or (isinstance(self.tool_choice, str) and self.tool_choice == "none"):
+            conv_template.use_function_calling = False
+            return
+
+        # select the tool based on the tool_choice if specified
+        if isinstance(self.tool_choice, dict):
+            if self.tool_choice["type"] != "function":  # pylint: disable=unsubscriptable-object
+                raise BadRequestError("Only 'function' tool choice is supported")
+
+            if len(self.tool_choice["function"]) > 1:  # pylint: disable=unsubscriptable-object
+                raise BadRequestError("Only one tool is supported when tool_choice is specified")
+
+            for tool in self.tools:  # pylint: disable=not-an-iterable
+                if (
+                    tool.function.name
+                    == self.tool_choice["function"][  # pylint: disable=unsubscriptable-object
+                        "name"
+                    ]
+                ):
+                    conv_template.use_function_calling = True
+                    conv_template.function_string = tool.function.model_dump_json()
+                    return
+
+            # pylint: disable=unsubscriptable-object
+            raise BadRequestError(
+                f"The tool_choice function {self.tool_choice['function']['name']}"
+                " is not found in the tools list"
+            )
+            # pylint: enable=unsubscriptable-object
+
+        if isinstance(self.tool_choice, str) and self.tool_choice != "auto":
+            raise BadRequestError(f"Invalid tool_choice value: {self.tool_choice}")
+
+        function_list = []
+        for tool in self.tools:  # pylint: disable=not-an-iterable
+            if tool.type != "function":
+                raise BadRequestError("Only 'function' tool type is supported")
+            function_list.append(tool.function.model_dump())
+
+        conv_template.use_function_calling = True
+        conv_template.function_string = json.dumps(function_list)
+
 
 class ChatCompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "tool_calls", "error"]] = None
@@ -254,7 +329,7 @@ class ChatCompletionResponseChoice(BaseModel):
 
 
 class ChatCompletionStreamResponseChoice(BaseModel):
-    finish_reason: Optional[Literal["stop", "length", "tool_calls"]] = None
+    finish_reason: Optional[Literal["stop", "length", "tool_calls", "error"]] = None
     index: int = 0
     delta: ChatCompletionMessage
     logprobs: Optional[LogProbs] = None
@@ -268,7 +343,7 @@ class ChatCompletionResponse(BaseModel):
     id: str
     choices: List[ChatCompletionResponseChoice]
     created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
+    model: Optional[str] = None
     system_fingerprint: str
     object: Literal["chat.completion"] = "chat.completion"
     usage: UsageInfo = Field(
@@ -284,9 +359,12 @@ class ChatCompletionStreamResponse(BaseModel):
     id: str
     choices: List[ChatCompletionStreamResponseChoice]
     created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
+    model: Optional[str] = None
     system_fingerprint: str
     object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
+    usage: UsageInfo = Field(
+        default_factory=lambda: UsageInfo()  # pylint: disable=unnecessary-lambda
+    )
 
 
 ################################################
@@ -311,6 +389,8 @@ def openai_api_get_generation_config(
     request: Union[CompletionRequest, ChatCompletionRequest]
 ) -> Dict[str, Any]:
     """Create the generation config from the given request."""
+    from ..serve.config import ResponseFormat  # pylint: disable=import-outside-toplevel
+
     kwargs: Dict[str, Any] = {}
     arg_names = [
         "n",
@@ -333,5 +413,8 @@ def openai_api_get_generation_config(
         kwargs["max_tokens"] = -1
     if request.stop is not None:
         kwargs["stop_strs"] = [request.stop] if isinstance(request.stop, str) else request.stop
-    kwargs["response_format"] = ResponseFormat(**request.response_format.model_dump())
+    if request.response_format is not None:
+        kwargs["response_format"] = ResponseFormat(
+            **request.response_format.model_dump(by_alias=True)
+        )
     return kwargs

@@ -5,8 +5,8 @@
 
 #include "grammar_parser.h"
 
-#include "../../metadata/json_parser.h"
 #include "../../support/encoding.h"
+#include "../../support/json_parser.h"
 #include "grammar_builder.h"
 
 namespace mlc {
@@ -16,7 +16,7 @@ namespace serve {
 class EBNFParserImpl {
  public:
   /*! \brief The logic of parsing the grammar string. */
-  BNFGrammar DoParse(String ebnf_string);
+  BNFGrammar DoParse(std::string ebnf_string, std::string main_rule);
 
  private:
   using Rule = BNFGrammarNode::Rule;
@@ -156,14 +156,14 @@ int32_t EBNFParserImpl::ParseCharacterClass() {
       continue;
     }
 
-    auto [codepoint, len] = Utf8OrEscapeToCodepoint(cur_, kCustomEscapeMap);
+    auto [codepoint, new_cur] = ParseNextUTF8OrEscaped(cur_, kCustomEscapeMap);
     if (codepoint == static_cast<TCodepoint>(CharHandlingError::kInvalidUtf8)) {
-      ThrowParseError("Invalid utf8 sequence");
+      ThrowParseError("Invalid UTF8 sequence");
     }
     if (codepoint == static_cast<TCodepoint>(CharHandlingError::kInvalidEscape)) {
       ThrowParseError("Invalid escape sequence");
     }
-    Consume(len);
+    Consume(new_cur - cur_);
     if (past_is_hyphen) {
       ICHECK(!elements.empty());
       if (elements.back().lower > codepoint) {
@@ -192,16 +192,17 @@ int32_t EBNFParserImpl::ParseString() {
   std::vector<int32_t> character_classes;
   while (Peek() && Peek() != '\"') {
     if (Peek() == '\r' || Peek() == '\n') {
-      ThrowParseError("String should not contain newline");
+      ThrowParseError("There should be no newline character in a string literal");
     }
-    auto [codepoint, len] = Utf8OrEscapeToCodepoint(cur_);
+
+    auto [codepoint, new_cur] = ParseNextUTF8OrEscaped(cur_);
     if (codepoint == static_cast<TCodepoint>(CharHandlingError::kInvalidUtf8)) {
       ThrowParseError("Invalid utf8 sequence");
     }
     if (codepoint == static_cast<TCodepoint>(CharHandlingError::kInvalidEscape)) {
       ThrowParseError("Invalid escape sequence");
     }
-    Consume(len);
+    Consume(new_cur - cur_);
     character_classes.push_back(builder_.AddCharacterClass({{codepoint, codepoint}}));
   }
   if (character_classes.empty()) {
@@ -391,7 +392,7 @@ void EBNFParserImpl::ResetStringIterator(const char* cur) {
   in_parentheses_ = false;
 }
 
-BNFGrammar EBNFParserImpl::DoParse(String ebnf_string) {
+BNFGrammar EBNFParserImpl::DoParse(std::string ebnf_string, std::string main_rule) {
   ResetStringIterator(ebnf_string.c_str());
   BuildRuleNameToId();
 
@@ -404,21 +405,22 @@ BNFGrammar EBNFParserImpl::DoParse(String ebnf_string) {
     ConsumeSpace();
   }
 
-  if (builder_.GetRuleId("main") == -1) {
-    ThrowParseError("There must be a rule named \"main\"");
+  // Check that the main rule is defined
+  if (builder_.GetRuleId(main_rule) == -1) {
+    ThrowParseError("The main rule with name \"" + main_rule + "\" is not found.");
   }
 
-  return builder_.Get();
+  return builder_.Get(main_rule);
 }
 
-BNFGrammar EBNFParser::Parse(String ebnf_string) {
+BNFGrammar EBNFParser::Parse(std::string ebnf_string, std::string main_rule) {
   EBNFParserImpl parser;
-  return parser.DoParse(ebnf_string);
+  return parser.DoParse(ebnf_string, main_rule);
 }
 
-BNFGrammar BNFJSONParser::Parse(String json_string) {
+BNFGrammar BNFJSONParser::Parse(std::string json_string) {
   auto node = make_object<BNFGrammarNode>();
-  auto grammar_json = json::ParseToJsonObject(json_string);
+  auto grammar_json = json::ParseToJSONObject(json_string);
   auto rules_json = json::Lookup<picojson::array>(grammar_json, "rules");
   for (const auto& rule_json : rules_json) {
     auto rule_json_obj = rule_json.get<picojson::object>();

@@ -9,13 +9,16 @@ from tvm import dlight as dl
 from tvm.relax import register_pipeline  # pylint: disable=no-name-in-module
 from tvm.relax.frontend import nn
 
+from mlc_llm.interface.compiler_flags import IPCAllReduceStrategyType
 from mlc_llm.support import logging
 
 from .attach_embedding_allocator import AttachAllocEmbeddingTensorFunc
 from .attach_logit_processor import AttachLogitProcessFunc
 from .attach_sampler import AttachGPUSamplingFunc
+from .attach_spec_decode_aux_funcs import AttachSpecDecodeAuxFuncs
 from .attach_support_info import (
     AttachAdditionalPrimFuncs,
+    AttachCUDAGraphSymbolicCaptureHints,
     AttachMemoryPlanAttr,
     AttachVariableBounds,
 )
@@ -31,6 +34,7 @@ from .fuse_ft_dequantize_matmul_epilogue import FuseFTDequantizeEpilogue
 from .fuse_transpose_matmul import FuseTransposeMatmul
 from .lift_global_buffer_alloc import LiftTIRGlobalBufferAlloc
 from .low_batch_specialization import LowBatchGemvSpecialize
+from .rewrite_softmax import RewriteTwoStageSoftmax
 from .scatter_tuple_get_item import ScatterTupleGetItem
 
 logger = logging.getLogger(__name__)
@@ -75,16 +79,20 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
     flashinfer: bool = False,
     cublas_gemm: bool = False,
     faster_transformer: bool = False,  # pylint: disable=unused-argument
+    allreduce_strategy: IPCAllReduceStrategyType = IPCAllReduceStrategyType.NONE,
     variable_bounds: Dict[str, int] = None,
+    cuda_graph_symbolic_capture_hints: Dict[str, List[str]] = None,
     additional_tirs: Dict[str, tvm.tir.PrimFunc] = None,
     metadata: Dict[str, Any] = None,
     ext_mods: List[nn.ExternModule] = None,
     debug_dump: Optional[Path] = None,
 ):
     variable_bounds = variable_bounds or {}
+    cuda_graph_symbolic_capture_hints = cuda_graph_symbolic_capture_hints or {}
     additional_tirs = additional_tirs or {}
     metadata = metadata or {}
     ext_mods = ext_mods or []
+    tensor_parallel_shards = metadata.get("tensor_parallel_shards", 1)
 
     @tvm.transform.module_pass(opt_level=0)
     def _pipeline(mod: tvm.ir.IRModule, _ctx: tvm.transform.PassContext) -> tvm.ir.IRModule:
@@ -93,10 +101,12 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 # Phase 0. Add additional information for compilation and remove unused Relax func
                 DispatchKVCacheCreation(target, flashinfer, metadata),
                 AttachVariableBounds(variable_bounds),
+                AttachCUDAGraphSymbolicCaptureHints(cuda_graph_symbolic_capture_hints),
                 AttachLogitProcessFunc(target),
                 AttachAdditionalPrimFuncs(additional_tirs),
                 AttachAllocEmbeddingTensorFunc(metadata),
                 AttachGPUSamplingFunc(target, variable_bounds),
+                AttachSpecDecodeAuxFuncs(tensor_parallel_shards),
                 AttachMemoryPlanAttr(),
                 tvm.tir.transform.BindTarget(tvm.target.Target.current(allow_none=False)),
                 _DebugDump("debug-phase0.py", debug_dump, show_meta=False),
@@ -111,6 +121,7 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 # Phase 2. Lowering to TIR, inherited TVM Relax's official "zero" pipeline
                 _LogProgress("Lowering to TVM TIR kernels"),
                 tvm.relax.backend.DispatchSortScan(),
+                RewriteTwoStageSoftmax(target=target),
                 tvm.relax.transform.LegalizeOps(),
                 tvm.relax.transform.AnnotateTIROpPattern(),
                 tvm.relax.transform.FoldConstant(),
@@ -147,9 +158,15 @@ def _mlc_llm_pipeline(  # pylint: disable=too-many-arguments
                 tvm.relax.transform.ToNonDataflow(),
                 tvm.relax.transform.RemovePurityChecking(),
                 tvm.relax.transform.CallTIRRewrite(),
+                (
+                    tvm.relax.transform.IPCAllReduceRewrite(allreduce_strategy)
+                    if allreduce_strategy != IPCAllReduceStrategyType.NONE
+                    else tvm.transform.Sequential([])
+                ),
                 tvm.relax.transform.StaticPlanBlockMemory(),
                 AttachMetadataWithMemoryUsage(metadata),
                 tvm.relax.transform.RewriteCUDAGraph(),
+                tvm.relax.transform.LowerGPUIPCAllocStorage(),
                 tvm.relax.transform.LowerAllocTensor(),
                 tvm.relax.transform.KillAfterLastUse(),
                 tvm.relax.transform.VMBuiltinLower(),

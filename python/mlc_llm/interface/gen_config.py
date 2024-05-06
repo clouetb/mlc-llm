@@ -2,10 +2,12 @@
 
 import dataclasses
 import json
+import re
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
+from mlc_llm.conversation_template import ConvTemplateRegistry
 from mlc_llm.model import Model
 from mlc_llm.quantization import Quantization
 from mlc_llm.support import convert_tiktoken, logging
@@ -45,11 +47,15 @@ class MLCChatConfig:  # pylint: disable=too-many-instance-attributes
     repetition_penalty: float = None
     top_p: float = None
     # Conversation template
-    conv_template: str = None
+    conv_template: Union[str, Dict[str, Any]] = None
     pad_token_id: int = None
     bos_token_id: int = None
     eos_token_id: int = None
+    # Tokenizer configuration
     tokenizer_files: List[str] = dataclasses.field(default_factory=list)
+    # The method to post-process the token table. See
+    # cpp/tokenizers.h::Tokenizer::PostProcessTokenTable for details
+    token_table_postproc_method: Literal["byte_fallback", "byte_level"] = None
     # Version control
     version: str = VERSION
 
@@ -74,6 +80,123 @@ class MLCChatConfig:  # pylint: disable=too-many-instance-attributes
                 logger.info("[System default] Setting %s: %s", bold(key), value)
 
 
+def check_string(s: str) -> bool:
+    """Check whether it's a string."""
+    delimit = s[1]
+    if s[0] != "b" or s[-1] != delimit:
+        return False
+    for i in range(2, len(s) - 1):
+        if s[i] == delimit and s[i - 1] != "\\":
+            return False
+    return True
+
+
+def txt2rwkv_tokenizer(vocab: Path, out: Path) -> None:
+    """Generate tokenizer_model from RWKV vocab file."""
+    idx2token = {}
+
+    with vocab.open("r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    for l in lines:
+        idx = int(l[: l.index(" ")])
+        raw = l[l.index(" ") : l.rindex(" ")].strip()
+        if check_string(raw):
+            x = eval(raw)  # pylint: disable=eval-used
+            x = x.encode("utf-8") if isinstance(x, str) else x
+            assert isinstance(x, bytes)
+            assert len(x) == int(l[l.rindex(" ") :])
+            idx2token[idx] = x
+        else:
+            raise ValueError("Unsupported vocab dictionary")
+
+    with (out / "tokenizer_model").open("wb") as f:
+        import msgpack  # pylint: disable=import-outside-toplevel,import-error
+
+        msgpack.pack(idx2token, f)
+
+
+def json2rwkv_tokenizer(vocab: Path, out: Path) -> None:
+    """Generate tokenizer_model from RWKV vocab file."""
+    idx2token = {}
+
+    with vocab.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+        for key, value in data.items():
+            x = key.encode("utf-8") if isinstance(key, str) else key
+            assert isinstance(x, bytes)
+            idx2token[int(value)] = x
+
+    with (out / "tokenizer_model").open("wb") as f:
+        import msgpack  # pylint: disable=import-outside-toplevel,import-error
+
+        msgpack.pack(idx2token, f)
+
+
+def detect_token_table_postproc_method(output_path: Path) -> Literal["byte_fallback", "byte_level"]:
+    """Detect the token table postprocessing method from tokenizer.json that is found under
+    output_path. If not detected, use ByteFallback as default.
+
+    Check the decoder field of the tokenizer. If it uses ByteFallback decoder, return
+    "byte_fallback". If it uses ByteLevel decoder, return "byte_level". Otherwise, use
+    ByteFallback as default.
+
+    See also cpp/tokenizers.h::Tokenizer::PostProcessTokenTable.
+    """
+    output_tokenizer_path = output_path / "tokenizer.json"
+    if not output_tokenizer_path.exists():
+        logger.warning(
+            "Tokenizer token table postprocessing method is not detected as tokenizer.json "
+            "is not found, use ByteFallback (the same as LLaMA/LLaMA2) by default"
+        )
+        return "byte_fallback"
+
+    with output_tokenizer_path.open("r", encoding="utf-8") as in_file:
+        tokenizer_json = json.load(in_file)
+
+    # Find all decoders in tokenizer.json
+    decoders = []
+
+    if "decoder" not in tokenizer_json:
+        logger.warning(
+            "Decoder field is not found in tokenizer.json, use ByteFallback (the same as "
+            "LLaMA/LLaMA2) as the token table postprocessing method by default"
+        )
+        return "byte_fallback"
+
+    decoders_json = tokenizer_json["decoder"]
+    assert "type" in decoders_json, "Decoder type is not specified in tokenizer.json"
+    if decoders_json["type"] == "Sequence":
+        assert "decoders" in decoders_json
+        decoders = decoders_json["decoders"]
+    else:
+        decoders = [decoders_json]
+
+    is_byte_level = False
+    is_byte_fallback = False
+
+    for decoder in decoders:
+        if decoder["type"] == "ByteLevel":
+            is_byte_level = True
+        if decoder["type"] == "ByteFallback":
+            is_byte_fallback = True
+    assert not (
+        is_byte_level and is_byte_fallback
+    ), "Tokenizer decoder cannot have both type ByteLevel and type ByteFallback"
+
+    if is_byte_level:
+        return "byte_level"
+    if is_byte_fallback:
+        return "byte_fallback"
+
+    logger.warning(
+        "Neither ByteLevel nor ByteFallback decoder is detected in tokenizer.json, use "
+        "ByteFallback (the same as LLaMA/LLaMA2) as the token table postprocessing method "
+        "by default"
+    )
+    return "byte_fallback"
+
+
 def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-branches,too-many-statements
     config: Path,
     model: Model,
@@ -89,6 +212,17 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
 ):
     """Entrypoint of MLC Chat configuration generation."""
     # Step 1. Initialize `mlc-chat-config.json` using `config.json`
+    conversation_reg = ConvTemplateRegistry.get_conv_template(conv_template)
+    if conversation_reg is None:
+        logger.warning(
+            "%s: Conversation template is not registered in ConvTemplateRegistry: %s",
+            red("Warning"),
+            conv_template,
+        )
+        conversation = conv_template  # type: ignore
+    else:
+        conversation = conversation_reg.to_json_dict()  # type: ignore
+
     model_config = ModelConfigOverride(
         context_window_size=context_window_size,
         sliding_window_size=sliding_window_size,
@@ -107,7 +241,7 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
         prefill_chunk_size=model_config.prefill_chunk_size,
         attention_sink_size=getattr(model_config, "attention_sink_size", -1),
         tensor_parallel_shards=model_config.tensor_parallel_shards,
-        conv_template=conv_template,
+        conv_template=conversation,
     )
     # Step 2. Load `generation_config.json` and `config.json` for text-generation related configs
     for generation_config_filename in ["generation_config.json", "config.json"]:
@@ -133,7 +267,18 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
             logger.info("%s tokenizer config: %s. Copying to %s", FOUND, file, bold(str(dest)))
         else:
             logger.info("%s tokenizer config: %s", NOT_FOUND, file)
-    # 3.2. If we have `tokenizer.model` but not `tokenizer.json`, try convert it to
+    # 3.2. Generate `tokenizer_model` for rwkv if `rwkv_vocab_.*` is found
+    pattern = re.compile(r"rwkv_vocab_v\d{8}\.(json|txt)")
+    for item in config.parent.iterdir():
+        if item.is_file() and pattern.match(item.name):
+            logger.info(
+                "%s RWKV vocab file: %s. Genetating %s", FOUND, item, bold("tokenizer_model")
+            )
+            if item.name.endswith(".txt"):
+                txt2rwkv_tokenizer(item, output)
+            else:
+                json2rwkv_tokenizer(item, output)
+    # 3.3. If we have `tokenizer.model` but not `tokenizer.json`, try convert it to
     # `tokenizer.json` with `transformers`.
     tokenizer_json_file = config.parent / "tokenizer.json"
     tokenizer_model_file = config.parent / "tokenizer.model"
@@ -178,6 +323,10 @@ def gen_config(  # pylint: disable=too-many-locals,too-many-arguments,too-many-b
         except Exception:  # pylint: disable=broad-exception-caught
             logger.exception("%s with the exception below. Skipping", FAILED)
 
+    # 3.4. Find the token table postprocessing method from tokenizer.json if it exists. If not
+    # detected, use "byte_fallback" as default.
+    mlc_chat_config.token_table_postproc_method = detect_token_table_postproc_method(output)
+
     # Step 4. Load system default value
     mlc_chat_config.apply_defaults()
     # Step 5. Dump the configuration file to output directory
@@ -197,6 +346,7 @@ TOKENIZER_FILES = [
 # FIXME: Copy RWKV tokenizer file # pylint: disable=fixme
 
 CONV_TEMPLATES = {
+    "llama-3",
     "chatml",
     "open_hermes_mistral",
     "neural_hermes_mistral",
@@ -212,6 +362,7 @@ CONV_TEMPLATES = {
     "rwkv_world",
     "rwkv",
     "gorilla",
+    "gorilla-openfunctions-v2",
     "guanaco",
     "dolly",
     "oasst",
@@ -231,4 +382,5 @@ CONV_TEMPLATES = {
     "stablelm-2",
     "gemma_instruction",
     "orion",
+    "llava",
 }

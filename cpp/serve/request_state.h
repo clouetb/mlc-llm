@@ -10,6 +10,8 @@
 #include <tvm/runtime/ndarray.h>
 #include <tvm/runtime/object.h>
 
+#include <optional>
+
 #include "../random.h"
 #include "../streamer.h"
 #include "config.h"
@@ -60,14 +62,8 @@ class RequestModelStateNode : public Object {
    * result of speculation.
    */
   std::vector<SampleResult> draft_output_tokens;
-  /*!
-   * \brief The probability distribution on each position in the
-   * draft. We keep the distributions for stochastic sampling when merging
-   * speculations from multiple models.
-   * \note We only need this value when we have multiple parallel small models
-   * and draft outputs in speculative inference settings.
-   */
-  std::vector<NDArray> draft_output_prob_dist;
+  /*! \brief The storage slots for the associated states of draft tokens. */
+  std::vector<int> draft_token_slots;
   /*! \brief The appeared committed and draft tokens and their occurrence times. */
   std::unordered_map<int32_t, int32_t> appeared_token_ids;
 
@@ -93,22 +89,25 @@ class RequestModelStateNode : public Object {
   /*! \brief Commit a new token into committed_tokens. Update appeared_token_ids. */
   void CommitToken(SampleResult sampled_token);
   /*! \brief Add a draft token into draft_output_tokens. Update appeared_token_ids. */
-  void AddDraftToken(SampleResult sampled_token, NDArray prob_dist);
-  /*! \brief Remove the last token from draft_output_tokens. Update appeared_token_ids. */
-  void RemoveLastDraftToken();
+  void AddDraftToken(SampleResult sampled_token, int draft_token_slot);
   /*! \brief Remove all draft tokens from draft_output_tokens. Update appeared_token_ids. */
-  void RemoveAllDraftTokens();
+  void RemoveAllDraftTokens(std::vector<int>* removed_draft_token_slots = nullptr);
 
   static constexpr const char* _type_key = "mlc.serve.RequestModelState";
   static constexpr const bool _type_has_method_sequal_reduce = false;
   static constexpr const bool _type_has_method_shash_reduce = false;
   TVM_DECLARE_BASE_OBJECT_INFO(RequestModelStateNode, Object);
+
+ private:
+  /*! \brief Remove the last token from draft_output_tokens. Update appeared_token_ids. */
+  void RemoveLastDraftToken();
 };
 
 class RequestModelState : public ObjectRef {
  public:
-  explicit RequestModelState(Request request, int model_id, int64_t internal_id, Array<Data> inputs,
-                             std::shared_ptr<GrammarStateInitContext> json_grammar_state_init_ctx);
+  explicit RequestModelState(
+      Request request, int model_id, int64_t internal_id, Array<Data> inputs,
+      const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestModelState, ObjectRef, RequestModelStateNode);
 };
@@ -213,10 +212,11 @@ class RequestStateEntryNode : public Object {
 
 class RequestStateEntry : public ObjectRef {
  public:
-  explicit RequestStateEntry(Request request, int num_models, int64_t internal_id, int rng_seed,
-                             const std::vector<std::string>& token_table,
-                             std::shared_ptr<GrammarStateInitContext> json_grammar_state_init_ctx,
-                             int parent_idx = -1);
+  explicit RequestStateEntry(
+      Request request, int num_models, int64_t internal_id, int rng_seed,
+      const std::vector<std::string>& token_table,
+      const std::optional<std::shared_ptr<GrammarStateInitContext>>& grammar_state_init_ctx,
+      int parent_idx = -1);
 
   TVM_DEFINE_MUTABLE_OBJECT_REF_METHODS(RequestStateEntry, ObjectRef, RequestStateEntryNode);
 };

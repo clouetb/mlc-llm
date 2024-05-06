@@ -13,7 +13,6 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:
     assert isinstance(func.body, relax.SeqExpr)
     assert len(func.body.blocks) == 1
     assert isinstance(func.body.blocks[0], relax.DataflowBlock)
-    assert len(func.body.blocks[0].bindings) == 2
     assert isinstance(func.body.blocks[0].bindings[0], relax.VarBinding)
     assert isinstance(func.body.blocks[0].bindings[0].value, relax.Call)
     assert func.body.blocks[0].bindings[0].value.op == tvm.ir.Op.get("relax.call_pure_packed")
@@ -23,7 +22,7 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:
 
     assert len(args) == 11
     assert isinstance(args[1], relax.ShapeExpr)
-    assert len(args[1].values) == 4
+    assert len(args[1].values) == 5
     for i in range(2, 10):
         assert isinstance(args[i], relax.PrimValue)
         assert isinstance(args[i].value, (tvm.tir.IntImm, tvm.tir.FloatImm))
@@ -34,6 +33,7 @@ def extract_creation_args(func: relax.Function) -> Dict[str, Any]:
         "max_total_seq_len": args[1].values[1],
         "prefill_chunk_size": args[1].values[2],
         "page_size": args[1].values[3],
+        "support_sliding_window": args[1].values[4],
         "num_hidden_layers": args[2].value.value,
         "num_attention_heads": args[3].value.value,
         "num_key_value_heads": args[4].value.value,
@@ -119,10 +119,19 @@ class DispatchKVCacheCreation:  # pylint: disable=too-many-instance-attributes
             "prefill_chunk_size_", relax.ShapeStructInfo([kwargs["prefill_chunk_size"]])
         )
         page_size = relax.Var("page_size_", relax.ShapeStructInfo([kwargs["page_size"]]))
+        support_sliding_window = relax.Var(
+            "support_sliding_window_", relax.ShapeStructInfo([kwargs["support_sliding_window"]])
+        )
 
         with bb.function(
             name="create_tir_paged_kv_cache",
-            params=[max_batch_size, max_total_seq_len, prefill_chunk_size, page_size],
+            params=[
+                max_batch_size,
+                max_total_seq_len,
+                prefill_chunk_size,
+                page_size,
+                support_sliding_window,
+            ],
         ):
             cache = kv_cache.TIRPagedKVCache(target=self.target, **kwargs)
             bb.emit_func_output(cache._expr)  # pylint: disable=protected-access
@@ -146,7 +155,7 @@ class DispatchKVCacheCreation:  # pylint: disable=too-many-instance-attributes
                 in self.metadata["model_type"]
             )
             # filter by attention group size
-            or kwargs["num_attention_heads"] // kwargs["num_key_value_heads"] not in [1, 4, 8]
+            or kwargs["num_attention_heads"] // kwargs["num_key_value_heads"] not in [1, 4, 6, 8]
         ):
             return
 
@@ -160,10 +169,19 @@ class DispatchKVCacheCreation:  # pylint: disable=too-many-instance-attributes
             "prefill_chunk_size_", relax.ShapeStructInfo([kwargs["prefill_chunk_size"]])
         )
         page_size = relax.Var("page_size_", relax.ShapeStructInfo([kwargs["page_size"]]))
+        support_sliding_window = relax.Var(
+            "support_sliding_window_", relax.ShapeStructInfo([kwargs["support_sliding_window"]])
+        )
 
         with bb.function(
             name="create_flashinfer_paged_kv_cache",
-            params=[max_batch_size, max_total_seq_len, prefill_chunk_size, page_size],
+            params=[
+                max_batch_size,
+                max_total_seq_len,
+                prefill_chunk_size,
+                page_size,
+                support_sliding_window,
+            ],
         ):
             cache = kv_cache.FlashInferPagedKVCache(target=self.target, **kwargs)
             bb.emit_func_output(cache._expr)  # pylint: disable=protected-access

@@ -1,4 +1,5 @@
 """Just-in-time compilation of MLC-Chat models."""
+
 import dataclasses
 import hashlib
 import json
@@ -92,7 +93,11 @@ def jit(model_path: Path, chat_config: Dict[str, Any], device: Device) -> Path:
             ]
             logger.info("Compiling using commands below:")
             logger.info("%s", blue(shlex.join(cmd)))
-            subprocess.run(cmd, check=True)
+            subprocess.run(cmd, check=False, env=os.environ)
+            # note on windows: compilation can succeed but return code is still nonzero
+            # check whether file exists instead
+            if not os.path.isfile(dso_path):
+                raise RuntimeError("Cannot find compilation output, compilation failed")
             shutil.move(dso_path, dst)
             logger.info("Using compiled model lib: %s", bold(dst))
 

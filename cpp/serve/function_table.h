@@ -41,7 +41,8 @@ using namespace tvm::runtime;
 struct FunctionTable {
   static PackedFunc SessionFuncAsPackedFunc(Session sess, DRef sess_func, String name);
 
-  void Init(TVMArgValue reload_lib, Device device, picojson::object model_config);
+  void Init(String reload_lib_path, Device device, picojson::object model_config,
+            Optional<Session> session);
 
   ObjectRef LoadParams(const std::string& model_path, Device device);
 
@@ -49,8 +50,20 @@ struct FunctionTable {
 
   ObjectRef Empty(ShapeTuple shape, DataType dtype, Device device) const;
 
+  /*!
+   * \brief Copy a host array to the worker or local gpu.
+   * \param host_array The host array to be copied.
+   * \param buffer_cache_key The key to the buffer cache.
+   * \param max_reserved_shape The maximum shape to be reserved in the buffer cache.
+   * \param local_only Whether to copy the array to the local gpu only. If true, the use_disco
+   *                  flag will be ignored. This can be useful for functions that run only on the
+   *                  local gpu when disco is enabled.
+   * \return The array on the worker or local gpu.
+   */
   ObjectRef CopyToWorker0(const NDArray& host_array, String buffer_cache_key,
-                          ShapeTuple max_reserved_shape);
+                          ShapeTuple max_reserved_shape, bool local_only = false);
+
+  void DebugCallFuncOnAllAllWorker(const String& func_name) const;
 
   bool use_disco = false;
   Device local_gpu_device;
@@ -66,11 +79,21 @@ struct FunctionTable {
   ModelMetadata model_metadata_;
 
   PackedFunc embed_func_;
+  PackedFunc image_embed_func_;
   PackedFunc single_batch_prefill_func_;
   PackedFunc single_batch_decode_func_;
   PackedFunc prefill_func_;
   PackedFunc decode_func_;
   PackedFunc verify_func_;
+  PackedFunc single_batch_prefill_to_last_hidden_func_;
+  PackedFunc single_batch_decode_to_last_hidden_func_;
+  PackedFunc prefill_to_last_hidden_func_;
+  PackedFunc decode_to_last_hidden_func_;
+  PackedFunc verify_to_last_hidden_func_;
+  PackedFunc fuse_embed_hidden_func_;
+  PackedFunc get_logits_func_;
+  PackedFunc batch_get_logits_func_;
+  PackedFunc batch_select_last_hidden_func_;
   PackedFunc softmax_func_;
   PackedFunc apply_logit_bias_func_;
   PackedFunc apply_penalty_func_;
@@ -81,19 +104,28 @@ struct FunctionTable {
   bool support_backtracking_kv_;
   PackedFunc kv_cache_add_sequence_func_;
   PackedFunc kv_cache_fork_sequence_func_;
+  PackedFunc kv_cache_enable_sliding_window_for_seq_;
   PackedFunc kv_cache_remove_sequence_func_;
   PackedFunc kv_cache_begin_forward_func_;
   PackedFunc kv_cache_end_forward_func_;
-  PackedFunc kv_cache_attention_func_;
   PackedFunc kv_cache_popn_func_;
   PackedFunc kv_cache_get_num_available_pages_func_;
+  PackedFunc kv_cache_get_total_sequence_length_func_;
   PackedFunc gpu_multinomial_from_uniform_func_;
   PackedFunc gpu_argsort_probs_func_;
   PackedFunc gpu_sample_with_top_p_func_;
   PackedFunc gpu_sampler_take_probs_func_;
+  PackedFunc gpu_verify_draft_tokens_func_;
+  PackedFunc gpu_renormalize_by_top_p_func_;
   PackedFunc nd_view_func_;
   PackedFunc nd_get_shape_func_;
   PackedFunc nd_copy_embedding_to_offset_func_;
+  PackedFunc tuple_getitem_func_;
+  // Auxiliary functions for speculative decoding.
+  PackedFunc gather_probs_func_;
+  PackedFunc scatter_probs_func_;
+  PackedFunc gather_hidden_states_func_;
+  PackedFunc scatter_hidden_states_func_;
 };
 
 }  // namespace serve

@@ -18,8 +18,6 @@ using namespace tvm::runtime;
 
 /*! \brief Runtime statistics of engine. */
 struct EngineStats {
-  /*! \brief The current total sequence length in the first model. */
-  int64_t current_total_seq_len = 0;
   /*! \brief The sum of "prefill time of each request". */
   double request_total_prefill_time = 0.0f;
   /*! \brief The sum of "decode time of each request". */
@@ -36,6 +34,10 @@ struct EngineStats {
   int64_t total_accepted_length = 0;
   /*! \brief The total number of speculated draft tokens. */
   int64_t total_draft_length = 0;
+  /*! \brief The number of accepted tokens in speculative decoding. */
+  std::vector<int64_t> accept_count;
+  /*! \brief The number of draft tokens in speculative decoding. */
+  std::vector<int64_t> draft_count;
 
   /*!
    * \brief Return the engine runtime statistics in JSON string.
@@ -51,6 +53,14 @@ struct EngineStats {
   String AsJSON() const;
   /*! \brief Reset all the statistics. */
   void Reset();
+
+  /*!
+   * \brief Update the statistics of speculative decoding.
+   * \param draft_length The number of draft tokens (including the last prediction by the base
+   * model)
+   * \param accept_length The number of accepted tokens in the speculative decoding.
+   */
+  void UpdateSpecDecodingStats(int draft_length, int accept_length);
 };
 
 /*! \brief The manager of internal id for requests in engine. */

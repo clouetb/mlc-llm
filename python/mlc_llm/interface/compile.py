@@ -1,4 +1,5 @@
 """Python entrypoint of compilation."""
+
 import dataclasses
 import math
 from io import StringIO
@@ -131,6 +132,7 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
             target=args.target,
             flashinfer=args.opt.flashinfer,
             faster_transformer=args.opt.faster_transformer,
+            cutlass=args.opt.cutlass,
         )
         # Step 1. Create the quantized model
         logger.info("Creating model from: %s", args.config)
@@ -161,6 +163,11 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
         logger.info("Running optimizations using TVM Unity")
         additional_tirs = _apply_preproc_to_params(named_params, model_config)
         variable_bounds = _get_variable_bounds(model_config)
+        cuda_graph_symbolic_capture_hints = {
+            "batch_decode": ["batch_size"],
+            "batch_decode_to_last_hidden_states": ["batch_size"],
+            "batch_verify_to_last_hidden_states": ["batch_size", "seq_len"],
+        }
         metadata = {
             "model_type": args.model.name,
             "quantization": args.quantization.name,
@@ -183,7 +190,9 @@ def _compile(args: CompileArgs, model_config: ConfigBase):
                     flashinfer=args.opt.flashinfer,
                     cublas_gemm=args.opt.cublas_gemm,
                     faster_transformer=args.opt.faster_transformer,
+                    allreduce_strategy=args.opt.ipc_allreduce_strategy,
                     variable_bounds=variable_bounds,
+                    cuda_graph_symbolic_capture_hints=cuda_graph_symbolic_capture_hints,
                     additional_tirs=additional_tirs,
                     ext_mods=ext_mods,
                     metadata=metadata,
